@@ -1,0 +1,35 @@
+[
+  {
+    "name": "synthetic_32",
+    "sequences": [
+      {
+        "proteinChain": {
+          "sequence": "ACDEFGHIKLMNPQRSTVWYACDEFGHIKLMN",
+          "count": 1
+        }
+      }
+    ]
+  },
+  {
+    "name": "synthetic_64",
+    "sequences": [
+      {
+        "proteinChain": {
+          "sequence": "ACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDE",
+          "count": 1
+        }
+      }
+    ]
+  },
+  {
+    "name": "synthetic_96",
+    "sequences": [
+      {
+        "proteinChain": {
+          "sequence": "ACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRS",
+          "count": 1
+        }
+      }
+    ]
+  }
+]

@@ -430,6 +430,146 @@ class Mol(nn.Module):
             self.confidence_head
         )(*args, **kwargs)
 
+    def prepare_inference_cache(self, input_feature_dict, z):
+        """Prepare per-complex atom and pair conditioning, without sample axes."""
+        cache = dict()
+        cache_mode = self._inference_diffusion_cache_mode()
+        conditioning_row_chunk = getattr(
+            self.configs.infer_setting,
+            "diffusion_conditioning_row_chunk_size",
+            None,
+        )
+        if cache_mode in {"full", "shared"}:
+            # line 1-5 of algorithm 21 calculate z in diffusion conditioning
+            if conditioning_row_chunk is None:
+                cache["pair_z"] = autocasting_disable_decorator(
+                    self.configs.skip_amp.sample_diffusion
+                )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
+                    input_feature_dict["relp"], z, False
+                )
+            else:
+                cache["pair_z"] = (
+                    self.diffusion_module.diffusion_conditioning.prepare_cache(
+                        input_feature_dict["relp"],
+                        z,
+                        False,
+                        row_chunk_size=int(conditioning_row_chunk),
+                    )
+                )
+            cache["p_lm/c_l"] = autocasting_disable_decorator(
+                self.configs.skip_amp.sample_diffusion
+            )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
+                ref_pos=input_feature_dict["ref_pos"],
+                ref_charge=input_feature_dict["ref_charge"],
+                ref_mask=input_feature_dict["ref_mask"],
+                ref_element=input_feature_dict["ref_element"],
+                ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
+                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+                d_lm=input_feature_dict["d_lm"],
+                v_lm=input_feature_dict["v_lm"],
+                pad_info=input_feature_dict["pad_info"],
+                r_l=True,
+                z=cache["pair_z"],
+                inplace_safe=False,
+            )
+        else:
+            cache["pair_z"] = None
+            cache["p_lm/c_l"] = [None, None]
+        return cache
+
+    def run_inference_heads(
+        self, input_feature_dict, s_inputs, s, z, coordinate, chunk_size,
+        kernels=None, inplace_safe=False,
+    ):
+        """Score one complex, keeping atom/chain metadata local to that input."""
+        kernels = kernels or {
+            "triangle_multiplicative": self._triangle_multiplicative_backend(),
+            "triangle_attention": self._triangle_attention_backend(),
+        }
+        pred_dict = {"coordinate": coordinate}
+        # Distogram logits: log contact_probs only, to reduce the dimension
+        pred_dict["contact_probs"] = autocasting_disable_decorator(True)(
+            sample_confidence.compute_contact_prob
+        )(
+            distogram_logits=self.distogram_head(z),
+            **sample_confidence.get_bin_params(self.configs.loss.distogram),
+        )  # [N_token, N_token]
+
+        # Confidence logits
+        (
+            pred_dict["plddt"],
+            pred_dict["pae"],
+            pred_dict["pde"],
+            pred_dict["resolved"],
+        ) = self.run_confidence_head(
+            input_feature_dict=input_feature_dict,
+            s_inputs=s_inputs,
+            s_trunk=s,
+            z_trunk=z,
+            pair_mask=None,
+            x_pred_coords=pred_dict["coordinate"],
+            triangle_multiplicative=kernels["triangle_multiplicative"],
+            triangle_attention=kernels["triangle_attention"],
+            inplace_safe=inplace_safe,
+            chunk_size=chunk_size,
+            pair_transition_chunk_size=self._pair_transition_chunk_size(
+                "confidence_pair_transition_chunk_size",
+                chunk_size,
+            ),
+        )
+
+        return pred_dict
+
+    def summarize_prediction(
+        self, pred_dict, input_feature_dict, N_cycle, label_dict=None, mode="inference"
+    ):
+        """Attach per-sample confidence summaries using one input's metadata."""
+        if label_dict is None:
+            interested_atom_mask = None
+        else:
+            interested_atom_mask = label_dict.get("interested_ligand_mask", None)
+        (
+            pred_dict["summary_confidence"],
+            pred_dict["full_data"],
+        ) = autocasting_disable_decorator(True)(
+            sample_confidence.compute_full_data_and_summary
+        )(
+            configs=self.configs,
+            pae_logits=pred_dict["pae"],
+            plddt_logits=pred_dict["plddt"],
+            pde_logits=pred_dict["pde"],
+            contact_probs=pred_dict.get(
+                "per_sample_contact_probs", pred_dict["contact_probs"]
+            ),
+            token_asym_id=input_feature_dict["asym_id"],
+            token_has_frame=input_feature_dict["has_frame"],
+            atom_coordinate=pred_dict["coordinate"],
+            atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
+            atom_is_polymer=1 - input_feature_dict["is_ligand"],
+            N_recycle=N_cycle,
+            interested_atom_mask=interested_atom_mask,
+            return_full_data=True,
+            mol_id=(input_feature_dict["mol_id"] if mode != "inference" else None),
+            elements_one_hot=(
+                input_feature_dict["ref_element"] if mode != "inference" else None
+            ),
+        )
+
+        return pred_dict
+
+    @torch.no_grad()
+    def forward_batch(self, input_features, seeds):
+        """Predict independent, variable-length no-MSA complexes together.
+
+        Returns one prediction dictionary per input, each retaining its own
+        diffusion-sample axis. Learned weights and the B=1 forward are shared.
+        """
+        from mol.model.batching import forward_batch
+
+        if self.training:
+            raise ValueError("forward_batch is inference-only; call model.eval()")
+        return forward_batch(self, input_features, seeds)
+
     def main_inference_loop(
         self,
         input_feature_dict: dict[str, Any],
@@ -609,49 +749,7 @@ class Mol(nn.Module):
         noise_schedule = self.inference_noise_scheduler(
             N_step=N_step, device=s_inputs.device, dtype=s_inputs.dtype
         )
-        cache = dict()
-        cache_mode = self._inference_diffusion_cache_mode()
-        conditioning_row_chunk = getattr(
-            self.configs.infer_setting,
-            "diffusion_conditioning_row_chunk_size",
-            None,
-        )
-        if cache_mode in {"full", "shared"}:
-            # line 1-5 of algorithm 21 calculate z in diffusion conditioning
-            if conditioning_row_chunk is None:
-                cache["pair_z"] = autocasting_disable_decorator(
-                    self.configs.skip_amp.sample_diffusion
-                )(self.diffusion_module.diffusion_conditioning.prepare_cache)(
-                    input_feature_dict["relp"], z, False
-                )
-            else:
-                cache["pair_z"] = (
-                    self.diffusion_module.diffusion_conditioning.prepare_cache(
-                        input_feature_dict["relp"],
-                        z,
-                        False,
-                        row_chunk_size=int(conditioning_row_chunk),
-                    )
-                )
-            cache["p_lm/c_l"] = autocasting_disable_decorator(
-                self.configs.skip_amp.sample_diffusion
-            )(self.diffusion_module.atom_attention_encoder.prepare_cache)(
-                ref_pos=input_feature_dict["ref_pos"],
-                ref_charge=input_feature_dict["ref_charge"],
-                ref_mask=input_feature_dict["ref_mask"],
-                ref_element=input_feature_dict["ref_element"],
-                ref_atom_name_chars=input_feature_dict["ref_atom_name_chars"],
-                atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-                d_lm=input_feature_dict["d_lm"],
-                v_lm=input_feature_dict["v_lm"],
-                pad_info=input_feature_dict["pad_info"],
-                r_l=True,
-                z=cache["pair_z"],
-                inplace_safe=False,
-            )
-        else:
-            cache["pair_z"] = None
-            cache["p_lm/c_l"] = [None, None]
+        cache = self.prepare_inference_cache(input_feature_dict, z)
         cache["projected_pair_biases"] = self._prepare_projected_pair_biases(
             cache["pair_z"]
         )
@@ -678,35 +776,9 @@ class Mol(nn.Module):
 
         step_diffusion = time.time()
         time_tracker.update({"diffusion": step_diffusion - step_trunk})
-        # Distogram logits: log contact_probs only, to reduce the dimension
-        pred_dict["contact_probs"] = autocasting_disable_decorator(True)(
-            sample_confidence.compute_contact_prob
-        )(
-            distogram_logits=self.distogram_head(z),
-            **sample_confidence.get_bin_params(self.configs.loss.distogram),
-        )  # [N_token, N_token]
-
-        # Confidence logits
-        (
-            pred_dict["plddt"],
-            pred_dict["pae"],
-            pred_dict["pde"],
-            pred_dict["resolved"],
-        ) = self.run_confidence_head(
-            input_feature_dict=input_feature_dict,
-            s_inputs=s_inputs,
-            s_trunk=s,
-            z_trunk=z,
-            pair_mask=None,
-            x_pred_coords=pred_dict["coordinate"],
-            triangle_multiplicative=self._triangle_multiplicative_backend(),
-            triangle_attention=self._triangle_attention_backend(),
+        pred_dict = self.run_inference_heads(
+            input_feature_dict, s_inputs, s, z, pred_dict["coordinate"], chunk_size,
             inplace_safe=inplace_safe,
-            chunk_size=chunk_size,
-            pair_transition_chunk_size=self._pair_transition_chunk_size(
-                "confidence_pair_transition_chunk_size",
-                chunk_size,
-            ),
         )
 
         step_confidence = time.time()
@@ -731,35 +803,8 @@ class Mol(nn.Module):
 
         # Summary Confidence & Full Data
         # Computed after coordinates and logits are permuted
-        if label_dict is None:
-            interested_atom_mask = None
-        else:
-            interested_atom_mask = label_dict.get("interested_ligand_mask", None)
-        (
-            pred_dict["summary_confidence"],
-            pred_dict["full_data"],
-        ) = autocasting_disable_decorator(True)(
-            sample_confidence.compute_full_data_and_summary
-        )(
-            configs=self.configs,
-            pae_logits=pred_dict["pae"],
-            plddt_logits=pred_dict["plddt"],
-            pde_logits=pred_dict["pde"],
-            contact_probs=pred_dict.get(
-                "per_sample_contact_probs", pred_dict["contact_probs"]
-            ),
-            token_asym_id=input_feature_dict["asym_id"],
-            token_has_frame=input_feature_dict["has_frame"],
-            atom_coordinate=pred_dict["coordinate"],
-            atom_to_token_idx=input_feature_dict["atom_to_token_idx"],
-            atom_is_polymer=1 - input_feature_dict["is_ligand"],
-            N_recycle=N_cycle,
-            interested_atom_mask=interested_atom_mask,
-            return_full_data=True,
-            mol_id=(input_feature_dict["mol_id"] if mode != "inference" else None),
-            elements_one_hot=(
-                input_feature_dict["ref_element"] if mode != "inference" else None
-            ),
+        self.summarize_prediction(
+            pred_dict, input_feature_dict, N_cycle, label_dict=label_dict, mode=mode
         )
 
         return pred_dict, log_dict, time_tracker

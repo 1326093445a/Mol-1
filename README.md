@@ -82,6 +82,12 @@ templates.
 
 **Prediction outputs**. Results are organized in `output/<job_name>/seed_<seed>/predictions/` as CIF structures with a confidence JSON per sample. Within each seed, samples are numbered by `ranking_score`, highest first, so `sample_0` is that seed's top-ranked structure.
 
+**Multiple inputs per GPU.** For independent complexes of different lengths
+without MSA, put them in one JSON job list and use `--use_msa false --batch_size 2`.
+Add `--sample 1` for one predicted structure per input, or keep the default five
+samples per input. See [input batching](docs/inference_batching.md) for supported
+settings, memory controls and multiple GPUs.
+
 **Confidence scores**. [docs/output_format.md](docs/output_format.md) describes every
 field, including two that trip people up — `plddt` is scaled 0–100 while
 `chain_plddt` is 0–1, and the PAE matrix is indexed by token rather than by
@@ -248,6 +254,7 @@ mark comprising 172 interface clusters from 150 PDB entries.** (a)–(c) Success
 - [Output format](docs/output_format.md)
 - [Kernel options](docs/kernels.md)
 - [Inference memory controls](docs/inference_memory.md)
+- [Independent inputs in one batch](docs/inference_batching.md)
 - [Reference data](docs/data_sources.md)
 - [MSA and template pipeline](docs/msa_template_pipeline.md)
 

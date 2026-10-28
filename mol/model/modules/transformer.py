@@ -233,6 +233,7 @@ class AttentionPairBias(nn.Module):
         inplace_safe: bool = False,
         enable_efficient_fusion: bool = False,
         pair_bias: Optional[torch.Tensor] = None,
+        extra_attn_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Used by Algorithm 7/20
 
@@ -280,6 +281,7 @@ class AttentionPairBias(nn.Module):
             inplace_safe=inplace_safe,
             enable_efficient_fusion=enable_efficient_fusion,
             pair_bias=pair_bias,
+            extra_attn_bias=extra_attn_bias,
         )
 
     def _torch_standard_multihead_attention(
@@ -290,6 +292,7 @@ class AttentionPairBias(nn.Module):
         inplace_safe: bool,
         enable_efficient_fusion: bool,
         pair_bias: Optional[torch.Tensor],
+        extra_attn_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Reference PyTorch SDPA implementation."""
         if pair_bias is None:
@@ -297,6 +300,13 @@ class AttentionPairBias(nn.Module):
                 pair_bias = self._project_pair_bias_from_normalized(z)
             else:
                 pair_bias = self.project_pair_bias(z)
+
+        if extra_attn_bias is not None:
+            # Insert sample/head axes before the two token axes; never merge
+            # the independent-input axis with the diffusion-sample axis.
+            while extra_attn_bias.ndim < pair_bias.ndim:
+                extra_attn_bias = extra_attn_bias.unsqueeze(-3)
+            pair_bias = pair_bias + extra_attn_bias.to(pair_bias)
 
         return self.attention(
             q_x=q,
@@ -316,6 +326,7 @@ class AttentionPairBias(nn.Module):
         chunk_size: Optional[int] = None,
         enable_efficient_fusion: bool = False,
         pair_bias: Optional[torch.Tensor] = None,
+        extra_attn_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Details are given in local_forward and standard_forward"""
         # Input projections
@@ -334,6 +345,8 @@ class AttentionPairBias(nn.Module):
 
         # Multihead attention with pair bias
         if n_queries and n_keys:
+            if extra_attn_bias is not None:
+                raise ValueError("Token padding bias is only supported by global attention")
             a = self.local_multihead_attention(
                 a,
                 kv if self.cross_attention_mode else a,
@@ -351,6 +364,7 @@ class AttentionPairBias(nn.Module):
                 inplace_safe=inplace_safe,
                 enable_efficient_fusion=enable_efficient_fusion,
                 pair_bias=pair_bias,
+                extra_attn_bias=extra_attn_bias,
             )
 
         # Output projection (from adaLN-Zero [27])
@@ -420,6 +434,7 @@ class DiffusionTransformerBlock(nn.Module):
         chunk_size: Optional[int] = None,
         enable_efficient_fusion: bool = False,
         pair_bias: Optional[torch.Tensor] = None,
+        extra_attn_bias: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -454,6 +469,7 @@ class DiffusionTransformerBlock(nn.Module):
                 chunk_size=chunk_size,
                 enable_efficient_fusion=enable_efficient_fusion,
                 pair_bias=pair_bias,
+                extra_attn_bias=extra_attn_bias,
             )
         )
         if inplace_safe:
@@ -524,6 +540,7 @@ class DiffusionTransformer(nn.Module):
         chunk_size: Optional[int] = None,
         enable_efficient_fusion: bool = False,
         projected_pair_biases: Optional[ProjectedPairBiases] = None,
+        extra_attn_bias: Optional[torch.Tensor] = None,
     ) -> list[Callable]:
         blocks = [
             partial(
@@ -533,6 +550,7 @@ class DiffusionTransformer(nn.Module):
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
                 enable_efficient_fusion=enable_efficient_fusion,
+                extra_attn_bias=extra_attn_bias,
                 pair_bias=(
                     None
                     if projected_pair_biases is None
@@ -594,6 +612,7 @@ class DiffusionTransformer(nn.Module):
         chunk_size: Optional[int] = None,
         enable_efficient_fusion: bool = False,
         projected_pair_biases: Optional[ProjectedPairBiases] = None,
+        extra_attn_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply all Diffusion Transformer blocks.
 
@@ -653,6 +672,7 @@ class DiffusionTransformer(nn.Module):
             chunk_size=chunk_size,
             enable_efficient_fusion=enable_efficient_fusion,
             projected_pair_biases=pair_biases_for_blocks,
+            extra_attn_bias=extra_attn_bias,
         )
         a, s, z = checkpoint_blocks(
             blocks, args=(a, s, z), blocks_per_ckpt=blocks_per_ckpt

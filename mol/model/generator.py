@@ -21,6 +21,7 @@
 from functools import partial
 from typing import Any, Callable, Optional
 
+import numpy as np
 import torch
 
 from mol.model.modules.transformer import ProjectedPairBiases
@@ -188,6 +189,11 @@ def sample_diffusion(
     batch_shape = s_inputs.shape[:-2]
     device = s_inputs.device
     dtype = s_inputs.dtype
+    # Explicit per-input seeds let the batched and singleton samplers share
+    # noise streams without depending on input order or padded atom counts.
+    seed = input_feature_dict.get("inference_seed")
+    generator = None if seed is None else torch.Generator(device=device).manual_seed(int(seed))
+    numpy_rng = None if seed is None else np.random.default_rng(int(seed))
     request_denoise_net = (
         partial(denoise_net, projected_pair_biases=projected_pair_biases)
         if projected_pair_biases is not None
@@ -197,7 +203,8 @@ def sample_diffusion(
         # init noise
         # [..., N_sample, N_atom, 3]
         x_l = noise_schedule[0] * torch.randn(
-            size=(*batch_shape, chunk_n_sample, N_atom, 3), device=device, dtype=dtype
+            size=(*batch_shape, chunk_n_sample, N_atom, 3), device=device, dtype=dtype,
+            generator=generator,
         )  # NOTE: set seed in distributed training
 
         for step_i, (c_tau_last, c_tau) in enumerate(
@@ -205,7 +212,10 @@ def sample_diffusion(
         ):
             # [..., N_sample, N_atom, 3]
             x_l = (
-                centre_random_augmentation(x_input_coords=x_l, N_sample=1)
+                centre_random_augmentation(
+                    x_input_coords=x_l, N_sample=1,
+                    torch_generator=generator, numpy_rng=numpy_rng,
+                )
                 .squeeze(dim=-3)
                 .to(dtype)
             )
@@ -217,7 +227,7 @@ def sample_diffusion(
 
             delta_noise_level = torch.sqrt(t_hat**2 - c_tau_last**2)
             x_noisy = x_l + noise_scale_lambda * delta_noise_level * torch.randn(
-                size=x_l.shape, device=device, dtype=dtype
+                size=x_l.shape, device=device, dtype=dtype, generator=generator
             )
 
             # 2. Denoise from x_{t_hat} to x_{c_tau}

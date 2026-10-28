@@ -38,6 +38,7 @@ inference_configs = {
     "input_json_path": RequiredValue(str),
     "load_checkpoint_dir": os.path.join(MOL_ROOT_DIR, "checkpoint"),
     "num_workers": 0,
+    "batch_size": 1,  # independent complexes per forward, separate from N_sample
     "use_msa": True,
     # FP32 matrix multiplications stay FP32; true runs them on TF32 tensor
     # cores, 4-8% faster with slightly different results.
@@ -58,3 +59,36 @@ inference_configs = {
         "sample_diffusion_chunk_size": ValueMaybeNone(1),
     },
 }
+
+
+def validate_input_batching(configs, *, batch_size=None):
+    """Check the supported no-MSA inference mode before loading model assets."""
+    size = configs.get("batch_size", 1) if batch_size is None else batch_size
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise ValueError("batch_size must be a positive integer")
+    if size == 1:
+        return
+    unsupported = []
+    for key in ("use_msa", "use_template", "use_rna_msa"):
+        if configs.get(key, False):
+            unsupported.append(f"{key}=true")
+    for key in ("triangle_multiplicative", "triangle_attention"):
+        if configs[key] not in ("auto", "torch"):
+            unsupported.append(f"{key}={configs[key]} (choose auto or torch)")
+    if configs.model.N_model_seed != 1:
+        unsupported.append("model.N_model_seed != 1")
+    if configs.get("mc_dropout_apply_rate", 0) != 0:
+        unsupported.append("mc_dropout_apply_rate != 0")
+    if configs.get("num_workers", 0) != 0:
+        unsupported.append("num_workers != 0 (per-job featurization seeding)")
+    if configs.get("device", "auto").startswith("mps"):
+        unsupported.append("MPS (batching supports CPU and CUDA)")
+    if unsupported:
+        raise ValueError("batch_size > 1 does not support: " + ", ".join(unsupported))
+    for name, value in (
+        ("model.N_cycle", configs.model.N_cycle),
+        ("sample_diffusion.N_step", configs.sample_diffusion.N_step),
+        ("sample_diffusion.N_sample", configs.sample_diffusion.N_sample),
+    ):
+        if value < 1:
+            raise ValueError(f"{name} must be positive")

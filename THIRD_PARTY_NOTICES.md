@@ -30,6 +30,15 @@ implementations derive from [OpenFold](https://github.com/aqlaboratory/openfold)
 These projects use Apache-2.0; third-party components retain their
 respective licenses and copyright notices.
 
+## OpenDDE input batching
+
+The ragged batching helpers in `mol/model/batching.py`, batched triangle row
+chunking, and portions of `tests/test_input_batching.py` are adapted from
+OpenDDE under Apache-2.0. They retain its notice:
+"Copyright (c) 2026 Aureka AI Research", together with the Molence Bio
+modification notice. The adaptation uses Mol-1's existing weights, trunk,
+diffusion caches and confidence heads.
+
 ## FlashPairformer TMK3 (`opt_core`)
 
 `mol/model/triangular/flashpairformer.py` is an adapter written for

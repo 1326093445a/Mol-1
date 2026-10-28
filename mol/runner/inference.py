@@ -35,7 +35,7 @@ from biotite.structure import AtomArray
 
 from mol.config.base import configs as configs_base
 from mol.config.data import data_configs
-from mol.config.inference import inference_configs
+from mol.config.inference import inference_configs, validate_input_batching
 from mol.config.model_type import model_configs
 from mol.config.parser import parse_configs, parse_sys_args
 from mol.data.inference.infer_dataloader import get_inference_dataloader
@@ -60,6 +60,11 @@ class InferenceRunner(object):
     """
 
     def __init__(self, configs: Any) -> None:
+        validate_input_batching(configs)
+        if configs.get("batch_size", 1) > 1:
+            configs.triangle_multiplicative = "torch"
+            configs.triangle_attention = "torch"
+            logger.info("Independent-input batching uses PyTorch triangle kernels.")
         self.configs = configs
         self.init_env()
         self.init_basics()
@@ -215,6 +220,17 @@ class InferenceRunner(object):
         """
         if DIST_WRAPPER.rank == 0:
             logger.info(msg)
+
+    @torch.no_grad()
+    def predict_batch(self, inputs, seeds):
+        """Run several independent complexes through the batched token networks."""
+        precision = {"fp32": torch.float32, "bf16": torch.bfloat16,
+                     "fp16": torch.float16}[self.configs.dtype]
+        amp = (torch.autocast("cuda", dtype=precision)
+               if self.device.type == "cuda" else nullcontext())
+        features = [to_device(data, self.device)["input_feature_dict"] for data in inputs]
+        with amp:
+            return self.model.forward_batch(features, seeds)
 
     def update_model_configs(self, new_configs: Any) -> None:
         """
@@ -565,6 +581,11 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
         runner (InferenceRunner): The initialized runner instance.
         configs (Any): Inference configurations.
     """
+    if getattr(configs, "batch_size", 1) > 1:
+        from mol.runner.batched_prediction import infer_predict_batched
+
+        return infer_predict_batched(runner, configs)
+
     # Data loading
     logger.info(f"Loading data from {configs.input_json_path}")
     with open(configs.input_json_path, "r", encoding="utf-8") as f:
@@ -822,6 +843,7 @@ def run() -> None:
         f"Optimization: diffusion_cache={configs.diffusion_cache_mode}, "
         f"efficient_fusion={configs.enable_efficient_fusion}, tf32={configs.enable_tf32}"
     )
+    validate_input_batching(configs)
     download_inference_cache(configs)
     main(configs)
 

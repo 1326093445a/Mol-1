@@ -120,6 +120,7 @@ class PairformerBlock(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         pair_transition_chunk_size: Optional[int] = None,
+        extra_attn_bias: Optional[torch.Tensor] = None,
     ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         """
         Forward pass of the PairformerBlock.
@@ -229,6 +230,7 @@ class PairformerBlock(nn.Module):
                 a=s,
                 s=None,
                 z=z,
+                extra_attn_bias=extra_attn_bias,
             )
             s = s + self.single_transition(s)
         return s, z
@@ -285,6 +287,7 @@ class PairMixerBlock(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         pair_transition_chunk_size: Optional[int] = None,
+        extra_attn_bias: Optional[torch.Tensor] = None,
     ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         """Update pair and single features without triangle attention.
 
@@ -335,6 +338,7 @@ class PairMixerBlock(nn.Module):
                 a=s,
                 s=None,
                 z=z,
+                extra_attn_bias=extra_attn_bias,
             )
             s = s + self.single_transition(s)
         return s, z
@@ -491,6 +495,7 @@ class PairformerStack(nn.Module):
         chunk_size: Optional[int] = None,
         pairmixer_transition_chunk_size: Optional[int] = None,
         pairformer_transition_chunk_size: Optional[int] = None,
+        extra_attn_bias: Optional[torch.Tensor] = None,
     ):
         block_kwargs = {
             "pair_mask": pair_mask,
@@ -498,6 +503,7 @@ class PairformerStack(nn.Module):
             "triangle_attention": triangle_attention,
             "inplace_safe": inplace_safe,
             "chunk_size": chunk_size,
+            "extra_attn_bias": extra_attn_bias,
         }
         blocks = []
         for block_idx, block in enumerate(self.blocks):
@@ -533,6 +539,7 @@ class PairformerStack(nn.Module):
         chunk_size: Optional[int] = None,
         pairmixer_transition_chunk_size: Optional[int] = None,
         pairformer_transition_chunk_size: Optional[int] = None,
+        extra_attn_bias: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -564,6 +571,7 @@ class PairformerStack(nn.Module):
             chunk_size=chunk_size,
             pairmixer_transition_chunk_size=pairmixer_transition_chunk_size,
             pairformer_transition_chunk_size=pairformer_transition_chunk_size,
+            extra_attn_bias=extra_attn_bias,
         )
 
         blocks_per_ckpt = self.blocks_per_ckpt

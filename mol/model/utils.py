@@ -38,6 +38,8 @@ def centre_random_augmentation(
     centre_only: bool = False,
     mask: Optional[torch.Tensor] = None,
     eps: float = 1e-12,
+    torch_generator: Optional[torch.Generator] = None,
+    numpy_rng: Optional[np.random.Generator] = None,
 ) -> torch.Tensor:
     """Implements Algorithm 19 in AF3
 
@@ -81,12 +83,12 @@ def centre_random_augmentation(
     # Generate N_augment (rot, trans) pairs
     batch_size_shape = x_input_coords.shape[:-3]
     rot_matrix_random = (
-        uniform_random_rotation(N_sample=N_augment)
+        uniform_random_rotation(N_sample=N_augment, random_state=numpy_rng)
         .to(device)
         .reshape(*batch_size_shape, N_sample, 3, 3)
     ).detach()  # [..., N_sample, 3, 3]
     trans_random = s_trans * torch.randn(
-        size=(*batch_size_shape, N_sample, 3), device=device
+        size=(*batch_size_shape, N_sample, 3), device=device, generator=torch_generator
     )  # [..., N_sample, 3]
     x_augment_coords = (
         rot_vec_mul(
@@ -101,7 +103,9 @@ def centre_random_augmentation(
 
 
 # Comment: Rotation.random is not supported by torch.compile()
-def uniform_random_rotation(N_sample: int = 1) -> torch.Tensor:
+def uniform_random_rotation(
+    N_sample: int = 1, random_state: Optional[np.random.Generator] = None
+) -> torch.Tensor:
     """Generate random rotation matrices with scipy.spatial.transform.Rotation
 
     Args:
@@ -111,7 +115,7 @@ def uniform_random_rotation(N_sample: int = 1) -> torch.Tensor:
         torch.Tensor: N_sample rot matrics
             [N_sample, 3, 3]
     """
-    rotation = Rotation.random(num=N_sample)
+    rotation = Rotation.random(num=N_sample, random_state=random_state)
     rot_matrix = torch.from_numpy(rotation.as_matrix()).float()  # [N_sample, 3, 3]
     return rot_matrix
 

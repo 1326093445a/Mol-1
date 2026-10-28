@@ -19,6 +19,7 @@
 # Upstream file: protenix/model/triangular/triangular.py
 # Changes: FlashPairformer backend for triangle multiplication.
 # Copyright 2021 AlQuraishi Laboratory
+# Batched row chunking adapted from OpenDDE, Copyright (c) 2026 Aureka AI Research.
 
 
 from abc import ABC, abstractmethod
@@ -627,6 +628,23 @@ class TriangleAttention(nn.Module):
         inplace_safe: bool = False,
     ) -> torch.Tensor:
         "triangle! triangle!"
+        if x.ndim > 3 and triangle_attention == "torch":
+            # Expanding then flattening B and the triangle-row axis would
+            # materialize [B, N, H, N, N]. Slice rows before broadcasting so
+            # memory remains bounded by the requested chunk.
+            output = x if inplace_safe else torch.empty_like(x)
+            for start in range(0, x.shape[-3], chunk_size):
+                end = start + chunk_size
+                chunk = x[..., start:end, :, :]
+                chunk_biases = [
+                    bias if bias.shape[-4] == 1 else bias[..., start:end, :, :, :]
+                    for bias in biases
+                ]
+                output[..., start:end, :, :] = self.mha(
+                    q_x=chunk, kv_x=chunk, biases=chunk_biases,
+                    triangle_attention=triangle_attention,
+                )
+            return output
         mha_inputs = {
             "q_x": x,
             "kv_x": x,
