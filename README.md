@@ -253,8 +253,7 @@ mark comprising 172 interface clusters from 150 PDB entries.** (a)–(c) Success
 
 ## Acknowledgements
 
-Mol-1 is derived from [Protenix](https://github.com/bytedance/Protenix),
-developed by the ByteDance AML AI4Science team. Protenix in turn builds on the
+Mol-1 is derived from [Protenix](https://github.com/bytedance/Protenix). Protenix builds on the
 AlphaFold 3 ecosystem, including AlphaFold 3, OpenFold and ColabFold. Original copyright
 notices and license headers are kept in every file derived from it, and files
 changed here say so and name the upstream revision they came from.
