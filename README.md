@@ -87,12 +87,24 @@ without MSA, put them in one JSON job list and use `--use_msa false --batch_size
 Add `--sample 1` for one predicted structure per input, or keep the default five
 samples per input. See [input batching](docs/inference_batching.md) for supported
 settings, memory controls and multiple GPUs.
+The batched CUDA path supports cuEquivariance and explicit TMK3. To process all
+five samples together, set `--infer_setting.sample_diffusion_chunk_size 5`;
+`--infer_setting.confidence_sample_chunk_size 5` also batches their scoring.
+
+**One complex across GPUs.** Launch with `torchrun` and
+`--context_parallel_size P --use_msa false` to distribute one prediction's
+token networks across P workers. See [context parallel inference](docs/context_parallel_inference.md)
+for the command and the limits of its memory savings.
 
 **Confidence scores**. [docs/output_format.md](docs/output_format.md) describes every
 field, including two that trip people up — `plddt` is scaled 0–100 while
 `chain_plddt` is 0–1, and the PAE matrix is indexed by token rather than by
 residue number. The per-token and per-atom data, the PAE matrix among them, go
 to a separate `full_data` JSON written only with `--need_atom_confidence true`.
+Protein-interface `ipsae_min_10` and its reference-normalization variant are
+included in the summary by default, including with `--need_atom_confidence false`;
+no separate PAE scoring script is needed. See the output-format guide for the
+exact definition and multichain pair records.
 
 **MSA and template**. For an input of your own, `mol pred` searches for what the JSON does not carry. Protein MSAs come from the public ColabFold MMseqs2 service, so
 `--use_msa`, on by default, needs network access. With `--use_template true`,

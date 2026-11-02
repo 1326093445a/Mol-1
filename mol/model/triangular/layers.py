@@ -509,13 +509,13 @@ class Attention(nn.Module):
         if biases is None:
             biases = []
 
+        if q_x.shape[-2] <= 16:
+            triangle_attention = "torch"
+
         # The cuEquivariance kernel applies the scaling itself
         q, k, v = self._prep_qkv(
             q_x, kv_x, apply_scale=triangle_attention in ["torch", "triattention"]
         )
-
-        if q.shape[-2] <= 16:
-            triangle_attention = "torch"
 
         if triangle_attention == "triattention":
             o = _tri_attention(q, k, v, biases)

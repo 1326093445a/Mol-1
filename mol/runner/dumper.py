@@ -27,6 +27,7 @@ import torch
 from biotite.structure import AtomArray
 
 from mol.data.utils import save_structure_cif
+from mol.metrics.ipsae import ipsae_summary, protein_token_groups
 from mol.utils.file_io import save_json
 from mol.utils.torch_utils import round_values
 
@@ -169,6 +170,7 @@ class DataDumper:
             sample_name=pdb_id,
             seed=seed,
             sorted_indices=sorted_indices,
+            atom_array=atom_array,
         )
 
     def _save_structure(
@@ -248,6 +250,7 @@ class DataDumper:
         sample_name: str,
         seed: int,
         sorted_indices: Optional[List[int]],
+        atom_array: Optional[AtomArray] = None,
     ):
         """
         Save confidence data to JSON files.
@@ -260,11 +263,22 @@ class DataDumper:
             sorted_indices (Optional[List[int]]): Indices for ranking.
         """
         N_sample = len(data["summary_confidence"])
+        groups = None
+        if atom_array is not None and data.get("full_data"):
+            first = data["full_data"][0]
+            groups = protein_token_groups(
+                atom_array, first["atom_to_token_idx"], first["token_pair_pae"].shape[0]
+            )
         for idx in range(N_sample):
             if self.need_atom_confidence:
                 data["full_data"][idx] = get_clean_full_confidence(
                     data["full_data"][idx]
                 )
+            if groups is not None:
+                data["summary_confidence"][idx].update(ipsae_summary(
+                    data["full_data"][idx]["token_pair_pae"], groups,
+                    pae_is_rounded=self.need_atom_confidence,
+                ))
         if sorted_indices is None:
             sorted_indices = range(N_sample)
         for idx, rank in enumerate(sorted_indices):

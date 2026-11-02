@@ -563,6 +563,14 @@ class PairformerStack(nn.Module):
                 [..., N_token, c_s]
                 [..., N_token, N_token, c_z]
         """
+        from mol.model.context_parallel import active_context, pairformer_parallel
+
+        if active_context() is not None:
+            return pairformer_parallel(
+                self, s, z, pair_mask, chunk_size,
+                pairmixer_transition_chunk_size, pairformer_transition_chunk_size,
+                extra_attn_bias,
+            )
         blocks = self._prep_blocks(
             pair_mask=pair_mask,
             triangle_multiplicative=triangle_multiplicative,

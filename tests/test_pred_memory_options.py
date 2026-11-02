@@ -71,6 +71,19 @@ class PredMemoryOptionsTest(unittest.TestCase):
                 self.assertIn("--infer_setting.chunk_size", result.output)
                 self.assertIsNone(kwargs)
 
+    def test_sample_and_padding_controls_reach_runner(self):
+        result, kwargs = self.invoke_pred(
+            "--infer_setting.confidence_sample_chunk_size", "5",
+            "--infer_setting.batch_max_padding_ratio", "1.4",
+            "--infer_setting.batch_max_pair_tokens", "2000000",
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(kwargs["memory_settings"], {
+            "infer_setting.confidence_sample_chunk_size": 5,
+            "infer_setting.batch_max_padding_ratio": 1.4,
+            "infer_setting.batch_max_pair_tokens": 2000000,
+        })
+
     def test_every_memory_option_is_listed_with_its_default(self):
         result = CliRunner().invoke(batch_inference.mol_cli, ["pred", "--help"])
         self.assertEqual(result.exit_code, 0, result.output)

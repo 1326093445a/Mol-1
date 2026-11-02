@@ -19,6 +19,7 @@
 # Upstream file: configs/configs_inference.py
 
 # pylint: disable=C0114
+import math
 import os
 from pathlib import Path
 
@@ -39,6 +40,7 @@ inference_configs = {
     "load_checkpoint_dir": os.path.join(MOL_ROOT_DIR, "checkpoint"),
     "num_workers": 0,
     "batch_size": 1,  # independent complexes per forward, separate from N_sample
+    "context_parallel_size": 1,  # GPUs cooperating on the same complex
     "use_msa": True,
     # FP32 matrix multiplications stay FP32; true runs them on TF32 tensor
     # cores, 4-8% faster with slightly different results.
@@ -57,6 +59,10 @@ inference_configs = {
     "infer_setting": {
         **base_model_configs["infer_setting"],
         "sample_diffusion_chunk_size": ValueMaybeNone(1),
+        "confidence_sample_chunk_size": ValueMaybeNone(1),
+        # Zero disables either scheduling limit. These never alter N_sample.
+        "batch_max_padding_ratio": 0.0,
+        "batch_max_pair_tokens": 0,
     },
 }
 
@@ -68,13 +74,25 @@ def validate_input_batching(configs, *, batch_size=None):
         raise ValueError("batch_size must be a positive integer")
     if size == 1:
         return
+    ratio = configs.infer_setting.get("batch_max_padding_ratio", 0.0)
+    if not math.isfinite(ratio) or (ratio != 0 and ratio < 1):
+        raise ValueError("batch_max_padding_ratio must be zero (disabled) or >= 1")
+    budget = configs.infer_setting.get("batch_max_pair_tokens", 0)
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
+        raise ValueError("batch_max_pair_tokens must be a non-negative integer")
     unsupported = []
     for key in ("use_msa", "use_template", "use_rna_msa"):
         if configs.get(key, False):
             unsupported.append(f"{key}=true")
-    for key in ("triangle_multiplicative", "triangle_attention"):
-        if configs[key] not in ("auto", "torch"):
-            unsupported.append(f"{key}={configs[key]} (choose auto or torch)")
+    for key, supported in (
+        (
+            "triangle_multiplicative",
+            ("auto", "torch", "cuequivariance", "flashpairformer"),
+        ),
+        ("triangle_attention", ("auto", "torch", "cuequivariance")),
+    ):
+        if configs[key] not in supported:
+            unsupported.append(f"{key}={configs[key]} (choose {', '.join(supported)})")
     if configs.model.N_model_seed != 1:
         unsupported.append("model.N_model_seed != 1")
     if configs.get("mc_dropout_apply_rate", 0) != 0:
@@ -92,3 +110,34 @@ def validate_input_batching(configs, *, batch_size=None):
     ):
         if value < 1:
             raise ValueError(f"{name} must be positive")
+
+
+def validate_context_parallel(configs):
+    """Validate the no-MSA, one-complex torchrun mode before loading assets."""
+    size = configs.get("context_parallel_size", 1)
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise ValueError("context_parallel_size must be a positive integer")
+    if size == 1:
+        return
+    if int(os.environ.get("WORLD_SIZE", "1")) != size:
+        raise ValueError(
+            "context_parallel_size must equal torchrun WORLD_SIZE; "
+            "launch with --nproc_per_node matching this value"
+        )
+    if configs.get("batch_size", 1) != 1:
+        raise ValueError(
+            "context parallelism requires batch_size=1; "
+            "all GPUs work on the same complex"
+        )
+    # Feature restrictions are shared; distributed stacks still require torch.
+    validate_input_batching(configs, batch_size=2)
+    for key in ("triangle_multiplicative", "triangle_attention"):
+        if configs[key] not in ("auto", "torch"):
+            raise ValueError(f"context parallelism requires {key}=auto or torch")
+    if configs.dtype not in ("fp32", "bf16"):
+        raise ValueError("context parallelism supports fp32 and bf16")
+    if configs.get("device", "auto") not in ("auto", "cuda", "cpu"):
+        raise ValueError(
+            "Use device=auto or cuda and CUDA_VISIBLE_DEVICES with torchrun, "
+            "not an explicit device index"
+        )

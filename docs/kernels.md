@@ -23,6 +23,15 @@ cuEquivariance on CUDA when its operator wheels import and to PyTorch
 otherwise. `mol doctor` prints what `auto` resolves to on the machine it runs
 on.
 
+Independent-input batches (`--batch_size > 1`) support cuEquivariance triangle
+operations and explicit FlashPairformer multiplication. `auto` resolves as it
+does for single inputs. TMK3 runs per input with shared packed weights; fused
+triangle attention keeps the independent-input axis without materializing a
+cubic bias tensor. See [batching settings and measurements](inference_batching.md).
+Context parallelism (`--context_parallel_size > 1`) still requires PyTorch
+triangle kernels. For a comparison that isolates batch size, keep kernels,
+precision and diffusion sample chunk size fixed across runs.
+
 ## Measurements
 
 Measured with the `mol pred` defaults (200 diffusion steps, 5 samples
@@ -97,6 +106,11 @@ triangle multiplications fall back to cuEquivariance.
 `flashpairformer_stats(model)` counts the calls served and the reasons for
 each fallback. A call it should serve whose dependency is missing, or whose
 kernel fails, raises an error.
+
+For Mol-1's 320- and 448-channel pairs, the adapter fits TMK3's channel tiles
+to divisors of the channel width. This avoids an assertion in the pinned
+upstream package's default Hopper tiles while retaining its exact-mode
+kernels and weight-cache invalidation.
 
 `opt_core` comes from
 [anthropics/uplifting-biomolecular-modeling](https://github.com/anthropics/uplifting-biomolecular-modeling)

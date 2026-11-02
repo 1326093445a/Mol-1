@@ -516,6 +516,9 @@ class Mol(nn.Module):
                 "confidence_pair_transition_chunk_size",
                 chunk_size,
             ),
+            sample_chunk_size=self.configs.infer_setting.get(
+                "confidence_sample_chunk_size", 1
+            ),
         )
 
         return pred_dict

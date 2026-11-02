@@ -157,6 +157,11 @@ class DiffusionConditioning(nn.Module):
             pair_z = pair_z + self.transition_z2(pair_z)
         return pair_z
 
+    def prepare_single_cache(self, s_inputs: torch.Tensor, s_trunk: torch.Tensor):
+        """Noise-independent single conditioning, scoped to one inference input."""
+        single = torch.cat((s_trunk, s_inputs), dim=-1)
+        return self.linear_no_bias_s(self.layernorm_s(single))
+
     def forward(
         self,
         t_hat_noise_level: torch.Tensor,
@@ -167,6 +172,7 @@ class DiffusionConditioning(nn.Module):
         pair_z: torch.Tensor,
         inplace_safe: bool = False,
         use_conditioning: bool = True,
+        single_s: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -205,10 +211,8 @@ class DiffusionConditioning(nn.Module):
                 pair_z_clone = pair_z.clone()
                 pair_z = pair_z_clone
         # Single conditioning
-        single_s = torch.cat(
-            tensors=[s_trunk, s_inputs], dim=-1
-        )  # [..., N_tokens, c_s + c_s_inputs]
-        single_s = self.linear_no_bias_s(self.layernorm_s(single_s))
+        if single_s is None:
+            single_s = self.prepare_single_cache(s_inputs, s_trunk)
         noise_n = self.fourier_embedding(
             t_hat_noise_level=torch.log(input=t_hat_noise_level / self.sigma_data) / 4
         ).to(

@@ -21,6 +21,7 @@ change, a checkpoint is loaded, or a module changes device.
 
 import importlib
 import logging
+import math
 import os
 import sys
 from collections import Counter
@@ -122,6 +123,51 @@ def _weight_cache(module, weights, compute_dtype):
     return module._flashpairformer_cache
 
 
+def _tmk3_with_fitted_tiles(
+    trimul, z, mask, weights, cache, compute_dtype, *, direction, eps,
+):
+    """Serve widths such as 320/448 using legal TMK3 channel tiles.
+
+    The pinned opt_core selector inherits 128-wide output tiles from C=256.
+    Its fit_cfg clamps tiles to C but does not make them divisors of C, so
+    these Mol-1 widths assert on Hopper. Use the same exact-mode kernels and
+    weight layout with fitted tiles, without changing upstream global state.
+    The public triangle_multiplication config argument does not reach TMK3.
+    """
+    kernels = importlib.import_module("opt_core.kernels.fpf_trimul.kernels")
+    selector = importlib.import_module("opt_core.kernels.fpf_trimul.trimul")
+    n, _, c = z.shape
+    cfg = kernels.fit_cfg(trimul.tmk3_cfg(selector, "exact", compute_dtype, n, c), c)
+    projection_width = (4 if cfg["A"].get("v", 2) == 14 else 2) * c
+    for stage, output_width in (("A", projection_width), ("C", c)):
+        cfg[stage]["BN"] = math.gcd(cfg[stage]["BN"], output_width)
+        cfg[stage]["BK"] = math.gcd(cfg[stage]["BK"], c)
+    if kernels.launch_grid_y(n, c, cfg) > kernels.CUDA_GRID_Y_MAX:
+        raise trimul.Refusal("launch_grid_y>65535", "tmk3_exact", "cueq")
+
+    packed = cache.get("mol_tmk3_weights")
+    if packed is None:
+        # _weight_cache invalidates this after weight/dtype/device changes.
+        def compute(tensor):
+            return tensor.detach().to(compute_dtype).contiguous()
+
+        packed = kernels.pack_weights(
+            weights["ln_in_w"].detach().contiguous(),
+            weights["ln_in_b"].detach().contiguous(),
+            compute(torch.cat([weights["w_ap"], weights["w_bp"]], 0)),
+            compute(torch.cat([weights["w_ag"], weights["w_bg"]], 0)),
+            weights["ln_out_w"].detach().contiguous(),
+            weights["ln_out_b"].detach().contiguous(),
+            compute(weights["w_o"]),
+            compute(weights["w_og"]),
+        )
+        cache["mol_tmk3_weights"] = packed
+    return kernels.trimul_forward(
+        z.contiguous(), direction, mask, packed, eps=eps, residual=False,
+        cfg=cfg, contract="cublas", cdt=compute_dtype,
+    )
+
+
 def triangle_multiplication(module, z, mask=None):
     """Return the BF16 update, or None to use Mol-1's stock backend.
 
@@ -134,6 +180,23 @@ def triangle_multiplication(module, z, mask=None):
         clear_flashpairformer_cache(module)
         _record(module, "fallback:autograd_or_training")
         return None
+    if z.ndim > 3 and z.shape[-3] == z.shape[-2]:
+        if mask is not None and (mask.shape != z.shape[:-1] or mask.device != z.device):
+            _record(module, "fallback:unsupported_mask_layout")
+            return None
+        # TMK3 operates on one square pair at a time. Preserve the independent
+        # input/sample axes while reusing the packed module weights.
+        flat_z = z.reshape(-1, *z.shape[-3:])
+        flat_mask = None if mask is None else mask.reshape(-1, *mask.shape[-2:])
+        updates = []
+        for i, pair in enumerate(flat_z):
+            update = triangle_multiplication(
+                module, pair, None if flat_mask is None else flat_mask[i]
+            )
+            if update is None:
+                return None
+            updates.append(update)
+        return torch.stack(updates).reshape(z.shape)
     compute_dtype = (
         torch.get_autocast_dtype("cuda")
         if z.is_cuda and torch.is_autocast_enabled("cuda")
@@ -173,16 +236,23 @@ def triangle_multiplication(module, z, mask=None):
     weights = _weights(module)
     cache = _weight_cache(module, weights, compute_dtype)
     try:
-        update = trimul.triangle_multiplication(
-            z,
-            mask,
-            direction="outgoing" if module._outgoing else "incoming",
-            weights=weights,
-            word="tmk3_exact",
-            residual=False,
-            cache=cache,
-            eps=module.layer_norm_in.eps,
-        )
+        direction = "outgoing" if module._outgoing else "incoming"
+        if module.c_z > 128 and module.c_z % 128:
+            update = _tmk3_with_fitted_tiles(
+                trimul, z, mask, weights, cache, compute_dtype,
+                direction=direction, eps=module.layer_norm_in.eps,
+            )
+        else:
+            update = trimul.triangle_multiplication(
+                z,
+                mask,
+                direction=direction,
+                weights=weights,
+                word="tmk3_exact",
+                residual=False,
+                cache=cache,
+                eps=module.layer_norm_in.eps,
+            )
     except trimul.Refusal as exc:
         _record(module, "fallback:upstream_refusal:" + str(exc))
         return None

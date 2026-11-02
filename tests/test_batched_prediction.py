@@ -39,9 +39,11 @@ def run_scheduler(
     featurization_failure=None,
     writer_failure=None,
     wrong_count=False,
+    budget_settings=None,
 ):
     cfg = tiny_config()
     cfg.batch_size = 2
+    cfg.infer_setting.update(budget_settings or {})
     cfg.input_json_path = "unused.json"
     cfg.use_seeds_in_json = per_job_seeds is not None
     calls, writes = [], []
@@ -141,6 +143,31 @@ def test_oom_retries_smaller_batches_without_losing_inputs(tmp_path, monkeypatch
     calls, writes = run_scheduler(tmp_path, monkeypatch, oom=True)
     assert [len(call) for call in calls] == [2, 1, 1, 1]
     assert [name for name, _, _ in writes] == ["job0", "job1", "job2"]
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"batch_max_padding_ratio": 1.2},
+        {"batch_max_pair_tokens": 17},
+    ],
+)
+def test_budget_splits_keep_all_inputs_and_seeds(tmp_path, monkeypatch, settings):
+    calls, writes = run_scheduler(tmp_path, monkeypatch, budget_settings=settings)
+    assert [len(call) for call in calls] == [1, 1, 1]
+    assert [name for name, _, _ in writes] == ["job0", "job1", "job2"]
+
+
+def test_padding_budget_accounts_for_cubic_work():
+    assert not batched_prediction._exceeds_batch_budget(
+        [128, 160], {"batch_max_padding_ratio": 1.4}
+    )
+    assert batched_prediction._exceeds_batch_budget(
+        [64, 256], {"batch_max_padding_ratio": 1.4}
+    )
+    assert not batched_prediction._exceeds_batch_budget(
+        [256], {"batch_max_pair_tokens": 10}
+    )
 
 
 @pytest.mark.parametrize(

@@ -30,8 +30,11 @@ original dimensions. No-MSA mode retains the existing query-only features.
 Batching requires:
 
 - `--use_msa false`, `--use_template false`, and `--use_rna_msa false`.
-- PyTorch triangle kernels: `auto` selects `torch` for input batches; explicit
-  `cuequivariance`, `triattention` and `flashpairformer` are rejected.
+- Triangle multiplication: `auto`, `torch`, `cuequivariance`, or
+  `flashpairformer`; triangle attention: `auto`, `torch`, or `cuequivariance`.
+  On CUDA, `auto` uses cuEquivariance when installed. TMK3 requires an explicit
+  `--trimul_kernel flashpairformer`; its per-input kernels reuse packed weights
+  inside the batch. `triattention` is not supported for independent batches.
 - CPU or CUDA, `num_workers=0`, no Monte Carlo dropout, and
   `model.N_model_seed=1`. The CLI's defaults meet these conditions except MSA.
 
@@ -39,11 +42,48 @@ All three diffusion cache modes (`full`, `shared`, `off`), efficient fusion,
 and the existing chunk controls remain available. The sample chunk size
 controls how many diffusion samples **per input** are denoised together.
 
+For five samples and ten recycles, a configuration to benchmark on an H200 is:
+
+```bash
+conda activate mol1
+mol pred -i inputs.json -o output/batched_fast \
+  --use_msa false --batch_size 2 --sample 5 --cycle 10 --step 200 \
+  --trimul_kernel cuequivariance --triatt_kernel cuequivariance \
+  --infer_setting.sample_diffusion_chunk_size 5 \
+  --infer_setting.confidence_sample_chunk_size 5 \
+  --infer_setting.batch_max_padding_ratio 1.4
+```
+
+This still produces five structures per input. Sample chunks change the number
+processed concurrently, not the number of samples, recycles or diffusion steps.
+Diffusion chunk size changes RNG draw ordering, so changing it does not preserve
+the exact coordinates for a seed. For comparisons of implementation numerics,
+hold the chunk size and kernels fixed. Both chunk defaults remain one to limit
+memory use. Confidence chunks automatically stay at one above 2,000 tokens,
+preserving the existing CPU offload policy for large confidence matrices.
+
+The batched implementation reuses trunk padding buffers and masks between
+recycles. In `full` and `shared` cache modes, it also reuses padded diffusion
+pairs, single conditioning and fully conditioned atom features between steps.
+`full` folds the padding mask into the cached per-block attention biases once.
+CUDA allocator blocks are retained after successful batches; OOM retries still
+release them. These changes do not alter the precision policy or TF32 setting.
+
 Jobs are sorted by approximate sequence length, then grouped without mixing
 the token-count thresholds that select different precision policies. A final
 partial batch is processed normally. CUDA forward OOMs retry smaller batches;
 a singleton failure or output-writing failure is reported and causes a
 nonzero exit after the other inputs finish.
+
+Two optional limits use **actual featurized token counts** to split batches:
+
+- `--infer_setting.batch_max_padding_ratio R` bounds
+  `B * max_tokens**3 / sum(tokens_i**3)`, an estimate of wasted triangle work.
+- `--infer_setting.batch_max_pair_tokens Q` bounds `B * max_tokens**2`, a proxy
+  for pair-state memory. It is not a byte or VRAM guarantee.
+
+Both default to zero (disabled). A singleton always runs, even if it exceeds
+the pair budget. Neither limit changes an input's samples or seed ownership.
 
 ## Seeds and multiple GPUs
 
@@ -68,6 +108,10 @@ torchrun --standalone --nproc_per_node 2 -m mol.runner.inference \
 
 Ranks own disjoint jobs, including all seeds of each job. No jobs are duplicated
 to pad a rank's workload. Each rank batches its inputs locally.
+
+To have multiple GPUs cooperate on a single complex, use
+[context parallel inference](context_parallel_inference.md) instead. It requires
+`--batch_size 1` and a matching `--context_parallel_size` and torchrun worker count.
 
 ## Memory and validation
 
@@ -112,3 +156,68 @@ The BF16 batch also produced finite outputs with the expected dimensions.
 The non-network CPU suite passed 213 tests (19 skipped), and the opt-in checkpoint
 test passed separately. These short runs validate execution, not prediction
 accuracy or a throughput improvement.
+
+## Reproducible throughput measurements
+
+`scripts/benchmark_input_batch.py` uses synthetic protein dimers of different
+lengths with the released checkpoint, five samples, ten recycles, 200 diffusion
+steps, and the CLI's precision policy. It writes a JSON report including warmup,
+repeat timings, peak allocated memory, environment and source hashes. Timings
+include input transfer, inference and confidence summaries; they exclude model
+loading, featurization, output validation and disk writing.
+
+```bash
+conda activate mol1
+MOL_ROOT_DIR=/storage/frank/mol1_root LAYERNORM_TYPE=torch \
+  CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=4 \
+  python scripts/benchmark_input_batch.py \
+  --checkpoint /storage/frank/mol1_root/checkpoint/mol-1-base.pt \
+  --output output/batch_benchmark.json --lengths 512 640 \
+  --kernel cuequivariance --attention cuequivariance \
+  --samples-per-call 5 --confidence-chunk 5
+```
+
+The script requires cached assets and never fetches a checkpoint. Synthetic
+timing fixtures do not establish prediction accuracy or production throughput
+for a different length/atom-count distribution.
+
+Measured on 2026-11-02 in `conda activate mol1` (Torch 2.13.0+cu130), on H200s,
+using PyTorch LayerNorm and TF32 disabled. Each row is one batch of two complexes
+producing ten structures total, with five samples, ten recycles and 200 diffusion
+steps. The trunk used BF16; diffusion and confidence used FP32. Times are medians
+of two repetitions after one warmup:
+
+| Token lengths | Implementation | Diffusion / confidence chunk | Seconds/batch | Peak allocated GiB |
+| --- | --- | --- | ---: | ---: |
+| 128, 160 | Original, torch kernels | 1 / 1 | 43.37 | 3.71 |
+| 128, 160 | Optimized, torch kernels | 1 / 1 | 41.02 | 3.71 |
+| 128, 160 | Original, torch kernels | 5 / 1 | 13.00 | 3.71 |
+| 128, 160 | Optimized, cuEquivariance | 5 / 5 | 11.82 | 5.33 |
+| 512, 640 | Original, torch kernels | 5 / 1 | 128.30 | 36.16 |
+| 512, 640 | Optimized, cuEquivariance | 5 / 5 | 68.76 | 45.46 |
+| 512, 640 | Optimized, TMK3 + cuEquivariance attention | 5 / 5 | 62.33 | 45.71 |
+
+The larger case is **2.06x faster** than the original code with diffusion sample
+chunking already enabled. TMK3 adds about 10% throughput over optimized
+cuEquivariance there. At 128/160 tokens the two fused backends are effectively
+tied. The much larger gain from 43.37 to 11.82 seconds on small inputs mostly
+comes from the pre-existing diffusion sample chunk control; it should not all
+be attributed to the new code. The faster configuration uses more memory.
+
+The local aggregate report is `output/batch_optimization_report.json`, with
+individual JSON reports and source hashes beside it. CPU featurization and disk
+output remain synchronous and are excluded from these timings.
+
+Validation included 244 CPU tests (three pre-existing pandas 3.1 vectorization
+failures deselected) and 30 GPU tests with 80 TMK3 subtests. A controlled FP32
+comparison against the saved original batching code produced bitwise-identical
+trunk, coordinate, PAE and pLDDT outputs using the same preprocessed inputs.
+A second controlled comparison with a BF16 trunk, FP32 diffusion/confidence,
+five samples, ten recycles and 200 steps was also bitwise identical. These
+comparisons held torch kernels and diffusion chunk size fixed and enabled
+deterministic algorithms; changing kernels or sample chunks has separate
+floating-point/RNG effects.
+The unchanged code in this environment already differs from singleton inference
+by 0.00356 angstrom RMS / 0.0171 angstrom maximum on the shortest checkpoint
+fixture; the checkpoint regression accounts for that measured baseline and also
+checks exact repeated-batch reproducibility.

@@ -488,7 +488,7 @@ class TriangleMultiplicativeUpdate(BaseTriangleMultiplicativeUpdate):
             z = kernel_triangular_mult(
                 z[None],
                 direction="outgoing" if self._outgoing else "incoming",
-                mask=z.new_ones(z.shape[:-1])[None] if mask is None else mask,
+                mask=(z.new_ones(z.shape[:-1]) if mask is None else mask)[None],
                 norm_in_weight=self.layer_norm_in.weight,
                 norm_in_bias=self.layer_norm_in.bias,
                 p_in_weight=torch.cat(
@@ -701,7 +701,14 @@ class TriangleAttention(nn.Module):
 
         biases = [mask_bias, triangle_bias]
 
-        if chunk_size is not None:
+        if triangle_attention == "cuequivariance" and x.ndim > 3:
+            # Keep B and triangle rows separate. Flattening them through
+            # chunk_layer expands the pair bias into a cubic-sized allocation.
+            # The fused kernel tiles attention internally.
+            x = self.mha(
+                q_x=x, kv_x=x, biases=biases, triangle_attention=triangle_attention
+            )
+        elif chunk_size is not None:
             x = self._chunk(
                 x,
                 biases,

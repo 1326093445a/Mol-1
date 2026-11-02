@@ -50,6 +50,10 @@ scores. `n_chain` below is the number of chains in the job.
 | `chain_pair_iptm` | `(n_chain, n_chain)` | Pairwise ipTM — the usual measure of interface reliability. |
 | `chain_pair_iptm_global` | `(n_chain, n_chain)` | Pairwise ipTM computed globally. |
 | `chain_pair_gpde` | `(n_chain, n_chain)` | Pairwise gPDE. |
+| `ipsae_min_10` | scalar or `null` | Conservative protein interface score: minimum of the two directional ipSAE scores, PAE cutoff 10 Å, benchmark count clip 27. Present by default; no full-data JSON required. |
+| `ipsae_min_10_d0ref` | scalar or `null` | Same calculation with the Dunbrack reference count clip 26. |
+| `ipsae_chain_pairs` | list | Protein chain pairs with their actual CIF chain labels, both directional scores, and both minima. |
+| `ipsae_parameters` | object | Cutoff, PAE rounding precision, and both count clips used for the calculation. |
 
 Two things that surprise people:
 
@@ -58,6 +62,38 @@ Two things that surprise people:
 - **The diagonal of every `chain_pair_*` matrix is `0.0`, and for a
   single-chain job so is `iptm`.** These are real zeros, not missing values: a
   chain paired with itself has no interface to score.
+
+### Native ipSAE
+
+Every normal prediction writes ipSAE into its summary without another model
+pass or an external scoring script. For exactly two protein chains,
+`ipsae_min_10` is their score. For fewer or more than two protein chains it is
+`null`; `ipsae_chain_pairs` contains every available pair explicitly. A pair
+with no PAE values below the cutoff scores zero. Nonprotein chains are excluded,
+and modified protein residues contribute only their CA token, once per residue.
+The existing `ranking_score` and output sample order do not change.
+
+The score matches postprocessing Mol-1's two-decimal full-data PAE, including
+rounding before the strict `PAE < 10` cutoff. For each direction, each residue's
+score averages `1 / (1 + (PAE / d0)^2)` over retained partners, with
+`d0 = max(1, 1.24 * cbrt(max(clip, partner_count) - 15) - 1.8)`.
+The directional score is the maximum of those residue scores; the reported
+minimum takes the smaller direction. The partner count is per residue, not
+the total interface size. This uses expected PAE values, not an expectation
+of the nonlinear score over PAE bins, and has no coordinate-distance cutoff.
+
+`ipsae_min_10` uses the existing benchmark convention `clip=27`.
+`ipsae_min_10_d0ref` uses `clip=26`, matching the protein normalization in the
+[pinned Dunbrack reference](https://github.com/DunbrackLab/IPSAE/blob/6174cf9e71cb1bd660cc805856a18c4871a6dec3/ipsae.py).
+The reference script's symmetric summary takes the **maximum** direction;
+Mol-1's explicitly named `min` fields take the minimum. The pair records expose
+both directions so the aggregation is auditable.
+
+When only structures and summary scores are needed, leave
+`--need_atom_confidence false` (the default). Native ipSAE still runs, and the
+large PAE/PDE/contact JSON files are neither serialized nor read back. Scoring
+runs in the output writer on in-memory PAE, so it also works for independent
+input batches and for the rank-zero writer in context-parallel inference.
 
 ## Per-token and per-atom data
 

@@ -12,7 +12,6 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from mol.config.inference import validate_input_batching
 from mol.model.utils import centre_random_augmentation
@@ -20,7 +19,7 @@ from mol.utils.torch_utils import autocasting_disable_decorator
 
 
 def pad_token_tensors(
-    values: list[torch.Tensor], *, pair: bool = False
+    values: list[torch.Tensor], *, pair: bool = False, out: torch.Tensor | None = None
 ) -> torch.Tensor:
     """Stack [*, T, C] or [*, T, T, C], padding only their token axes."""
     if not values:
@@ -36,16 +35,25 @@ def pad_token_tensors(
                 "Token dimensions must be nonempty; pair tensors must be square."
             )
     size = max(value.shape[-2] for value in values)
-    return torch.stack(
-        [
-            F.pad(
-                value,
-                (0, 0, 0, size - value.shape[-2])
-                + ((0, size - value.shape[-3]) if pair else ()),
-            )
-            for value in values
-        ]
-    )
+    shape = (len(values), *prefix, *((size, size) if pair else (size,)), width)
+    if out is None:
+        out = values[0].new_zeros(shape)
+    else:
+        if (
+            out.shape != shape
+            or out.dtype != values[0].dtype
+            or out.device != values[0].device
+        ):
+            raise ValueError("Padding buffer has incompatible shape, dtype or device")
+        # Callers reusing storage must supply values that do not alias it.
+        out.zero_()
+    for i, value in enumerate(values):
+        n = value.shape[-2]
+        if pair:
+            out[i, ..., :n, :n, :].copy_(value)
+        else:
+            out[i, ..., :n, :].copy_(value)
+    return out
 
 
 def token_masks(
@@ -86,8 +94,6 @@ def pairformer_batch(stack, singles, pairs, *, chunk_size=None, **kwargs):
         z=z,
         pair_mask=mask,
         extra_attn_bias=bias,
-        triangle_multiplicative="torch",
-        triangle_attention="torch",
         inplace_safe=True,
         chunk_size=chunk_size,
         **kwargs,
@@ -102,7 +108,10 @@ def pairformer_batch(stack, singles, pairs, *, chunk_size=None, **kwargs):
 
 def _trunk_batch(model, features, chunk_size):
     inputs, initial_s, initial_z = [], [], []
-    kernels = dict(triangle_multiplicative="torch", triangle_attention="torch")
+    kernels = dict(
+        triangle_multiplicative=model._triangle_multiplicative_backend(),
+        triangle_attention=model._triangle_attention_backend(),
+    )
     for feat in features:
         s_input = model.input_embedder(feat, inplace_safe=False, chunk_size=chunk_size)
         s = model.linear_no_bias_sinit(s_input)
@@ -117,6 +126,9 @@ def _trunk_batch(model, features, chunk_size):
         initial_z.append(z)
     singles = [torch.zeros_like(s) for s in initial_s]
     pairs = [torch.zeros_like(z) for z in initial_z]
+    lengths = [s.shape[-2] for s in initial_s]
+    mask, bias = token_masks(lengths, initial_z[0])
+    s_batch, z_batch = None, None
     for _ in range(model.N_cycle):
         for i, feat in enumerate(features):
             z = initial_z[i] + model.linear_no_bias_z_cycle(
@@ -142,10 +154,17 @@ def _trunk_batch(model, features, chunk_size):
             singles[i] = initial_s[i] + model.linear_no_bias_s(
                 model.layernorm_s(singles[i])
             )
-        singles, pairs = pairformer_batch(
-            model.pairformer_stack,
-            singles,
-            pairs,
+        # Reuse the padded storage between recycles. All local recycle updates
+        # above own their storage before these buffers are overwritten.
+        s_batch = pad_token_tensors(singles, out=s_batch)
+        z_batch = pad_token_tensors(pairs, pair=True, out=z_batch)
+        s_batch, z_batch = model.pairformer_stack(
+            s=s_batch,
+            z=z_batch,
+            pair_mask=mask,
+            extra_attn_bias=bias,
+            inplace_safe=True,
+            **kernels,
             chunk_size=chunk_size,
             pairmixer_transition_chunk_size=model._pair_transition_chunk_size(
                 "trunk_pairmixer_transition_chunk_size", chunk_size
@@ -154,10 +173,26 @@ def _trunk_batch(model, features, chunk_size):
                 "trunk_pairformer_transition_chunk_size", chunk_size
             ),
         )
+        singles = [s_batch[i, :n] for i, n in enumerate(lengths)]
+        pairs = [z_batch[i, :n, :n] for i, n in enumerate(lengths)]
+    # Only final outputs need independent storage; recycle views stay local.
+    singles = [s.clone() for s in singles]
+    pairs = [z.clone() for z in pairs]
     return list(zip(inputs, singles, pairs, strict=True))
 
 
-def _denoise_batch(module, states, noisy, levels, *, chunk_size, fusion, projections):
+def _denoise_batch(
+    module,
+    states,
+    noisy,
+    levels,
+    *,
+    chunk_size,
+    fusion,
+    projections,
+    static_pair=None,
+    attention_bias=None,
+):
     """Per-input atom networks surrounding one B x S token transformer."""
     atoms, conditions, pair_conditions, skips = [], [], [], []
     for (feat, s_input, s, z, cache), x, level in zip(
@@ -170,8 +205,10 @@ def _denoise_batch(module, states, noisy, levels, *, chunk_size, fusion, project
             s_trunk=s,
             z_trunk=z,
             pair_z=cache["pair_z"],
-            inplace_safe=True,
+            # The cached pair is read-only; cloning it on every step is wasteful.
+            inplace_safe=False,
             use_conditioning=True,
+            single_s=cache.get("single_s"),
         )
         a, q, c, p = module.atom_attention_encoder(
             feat["atom_to_token_idx"],
@@ -188,17 +225,21 @@ def _denoise_batch(module, states, noisy, levels, *, chunk_size, fusion, project
             z=pair.unsqueeze(-4),
             p_lm=cache["p_lm/c_l"][0],
             c_l=cache["p_lm/c_l"][1],
+            conditioned_cache=cache.get("conditioned_atom"),
             inplace_safe=True,
             chunk_size=chunk_size,
         )
         atoms.append(a.float() + module.linear_no_bias_s(module.layernorm_s(single)))
         conditions.append(single.float())
-        pair_conditions.append(pair.float())
+        if static_pair is None:
+            pair_conditions.append(pair.float())
         skips.append((q, c, p))
     lengths = [a.shape[-2] for a in atoms]
-    z_batch = pad_token_tensors(pair_conditions, pair=True).unsqueeze(-4)
-    _, bias = token_masks(lengths, z_batch)
-    if projections is None:
+    z_batch = static_pair
+    bias = attention_bias
+    if z_batch is None:
+        z_batch = pad_token_tensors(pair_conditions, pair=True).unsqueeze(-4)
+        _, bias = token_masks(lengths, z_batch)
         z_batch = module._prepare_diffusion_pair(z_batch, fusion)
     a_batch = module.diffusion_transformer(
         a=pad_token_tensors(atoms),
@@ -253,6 +294,12 @@ def sample_diffusion_batch(
         for state, seed in zip(states, seeds, strict=True)
     ]
     numpy_rngs = [np.random.default_rng(seed) for seed in seeds]
+    # Decide schedule branches once on the CPU, avoiding a CUDA scalar sync
+    # for every input at every denoising step and sample chunk.
+    gammas = [
+        [float(gamma0) if t > gamma_min else 0 for t in schedule[1:].tolist()]
+        for schedule in schedules
+    ]
     outputs: list[list[torch.Tensor]] = [[] for _ in states]
     chunk_size = chunk_size or n_sample
     for start in range(0, n_sample, chunk_size):
@@ -284,8 +331,8 @@ def sample_diffusion_batch(
                     .squeeze(-3)
                     .to(dtype)
                 )
-                last, current = schedule[step], schedule[step + 1]
-                gamma = float(gamma0) if current > gamma_min else 0
+                last = schedule[step]
+                gamma = gammas[i][step]
                 level = last * (gamma + 1)
                 noisy.append(
                     x
@@ -369,13 +416,51 @@ def forward_batch(model, features: list[dict[str, Any]], seeds: list[int]):
                     (feat, s_input.float(), s.float(), z.float(), local_cache)
                 )
             sample_schedules = [t.float() for t in schedules]
-        projections = None
-        if model._inference_diffusion_cache_mode() == "full":
-            projections = model._prepare_projected_pair_biases(
-                pad_token_tensors(
-                    [state[4]["pair_z"] for state in sample_states], pair=True
+        projections, static_pair, attention_bias = None, None, None
+        if model._inference_diffusion_cache_mode() != "off":
+            for feat, s_input, s, _, local_cache in sample_states:
+                local_cache["single_s"] = (
+                    model.diffusion_module.diffusion_conditioning.prepare_single_cache(
+                        s_input, s
+                    )
                 )
+                local_cache["conditioned_atom"] = (
+                    model.diffusion_module.atom_attention_encoder.prepare_conditioned_cache(
+                        feat["atom_to_token_idx"],
+                        s.unsqueeze(-3),
+                        *local_cache["p_lm/c_l"],
+                        inplace_safe=True,
+                    )
+                )
+            static_pair = pad_token_tensors(
+                [
+                    state[4]["pair_z"].float()
+                    if model._inference_diffusion_cache_mode() == "shared"
+                    else state[4]["pair_z"]
+                    for state in sample_states
+                ],
+                pair=True,
             )
+            _, attention_bias = token_masks(
+                [state[1].shape[-2] for state in sample_states], static_pair
+            )
+            if model._inference_diffusion_cache_mode() == "full":
+                from mol.model.modules.transformer import ProjectedPairBiases
+
+                projections = model._prepare_projected_pair_biases(static_pair)
+                # Fold the padding mask into each immutable per-block bias once.
+                projections = ProjectedPairBiases(
+                    tuple(
+                        block + attention_bias[:, None, None, :, :].to(block)
+                        for block in projections.blocks
+                    )
+                )
+                attention_bias = None
+                static_pair = static_pair.unsqueeze(-4)
+            else:
+                static_pair = model.diffusion_module._prepare_diffusion_pair(
+                    static_pair.unsqueeze(-4), model.enable_efficient_fusion
+                )
         return sample_diffusion_batch(
             sample_states,
             lambda x, t: _denoise_batch(
@@ -386,6 +471,8 @@ def forward_batch(model, features: list[dict[str, Any]], seeds: list[int]):
                 chunk_size=chunk,
                 fusion=model.enable_efficient_fusion,
                 projections=projections,
+                static_pair=static_pair,
+                attention_bias=attention_bias,
             ),
             schedules=sample_schedules,
             seeds=seeds,
@@ -417,7 +504,6 @@ def forward_batch(model, features: list[dict[str, Any]], seeds: list[int]):
             z,
             coordinate,
             chunk,
-            kernels=dict(triangle_multiplicative="torch", triangle_attention="torch"),
             inplace_safe=True,
         )
         predictions.append(model.summarize_prediction(pred, feat, model.N_cycle))

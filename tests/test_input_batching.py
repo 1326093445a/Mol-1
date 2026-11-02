@@ -235,7 +235,7 @@ def test_batch_configuration_rejects_unsupported_modes():
         ("use_msa", True),
         ("use_template", True),
         ("use_rna_msa", True),
-        ("triangle_attention", "cuequivariance"),
+        ("triangle_attention", "triattention"),
         ("num_workers", 2),
         ("mc_dropout_apply_rate", 0.4),
     ):

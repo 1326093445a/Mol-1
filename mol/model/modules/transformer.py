@@ -653,6 +653,13 @@ class DiffusionTransformer(nn.Module):
                     "every ProjectedPairBiases.blocks entry must be a tensor"
                 )
 
+        from mol.model.context_parallel import active_context, diffusion_parallel
+
+        if active_context() is not None and n_queries is None and n_keys is None:
+            return diffusion_parallel(
+                self, a, s, z, enable_efficient_fusion,
+                projected_pair_biases, extra_attn_bias,
+            )
         blocks_per_ckpt = self.blocks_per_ckpt
         if not torch.is_grad_enabled() or (
             projected_pair_biases is not None and not self.training
@@ -1028,6 +1035,37 @@ class AtomAttentionEncoder(nn.Module):
             )  # [..., N_sample, n_blocks, n_queries, n_keys, c_atompair]
         return p_lm, c_l
 
+    def prepare_conditioned_cache(
+        self, atom_to_token_idx, s, p_lm, c_l, inplace_safe=False
+    ):
+        """Finish noise-independent atom conditioning once per input.
+
+        The returned tensors include a singleton sample axis when s does.
+        Neither incoming cache tensor is mutated.
+        """
+        if s is not None:
+            c_l = c_l.unsqueeze(-3) + broadcast_token_to_atom(
+                x_token=self.linear_no_bias_s(self.layernorm_s(s)),
+                atom_to_token_idx=atom_to_token_idx,
+            )
+        c_l_q, c_l_k, _ = rearrange_qk_to_dense_trunk(
+            q=c_l,
+            k=c_l,
+            dim_q=-2,
+            dim_k=-2,
+            n_queries=self.n_queries,
+            n_keys=self.n_keys,
+            compute_mask=False,
+        )
+        p_lm = p_lm + self.linear_no_bias_cl(F.relu(c_l_q[..., None, :]))
+        if inplace_safe:
+            p_lm += self.linear_no_bias_cm(F.relu(c_l_k[..., None, :, :]))
+            p_lm += self.small_mlp(p_lm)
+        else:
+            p_lm = p_lm + self.linear_no_bias_cm(F.relu(c_l_k[..., None, :, :]))
+            p_lm = p_lm + self.small_mlp(p_lm)
+        return p_lm, c_l
+
     def forward(
         self,
         atom_to_token_idx: torch.Tensor,
@@ -1046,6 +1084,7 @@ class AtomAttentionEncoder(nn.Module):
         c_l: torch.Tensor = None,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        conditioned_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -1095,55 +1134,18 @@ class AtomAttentionEncoder(nn.Module):
                 z=z,
                 inplace_safe=inplace_safe,
             )
+        if conditioned_cache is None:
+            p_lm, c_l = self.prepare_conditioned_cache(
+                atom_to_token_idx,
+                s if r_l is not None else None,
+                p_lm,
+                c_l,
+                inplace_safe=inplace_safe,
+            )
         else:
-            if inplace_safe:
-                p_lm_clone = p_lm.clone()
-                c_l_clone = c_l.clone()
-                p_lm = p_lm_clone
-                c_l = c_l_clone
-
-        # Line7: Initialise the atom single representation as the single conditioning
-        # q_l = c_l.clone()
-
-        # If provided, add trunk embeddings and noisy positions
-        n_token = None
-        if r_l is not None:
-            # Broadcast the single and pair embedding from the trunk
-            n_token = s.size(-2)
-            c_l = c_l.unsqueeze(dim=-3) + broadcast_token_to_atom(
-                x_token=self.linear_no_bias_s(self.layernorm_s(s)),
-                atom_to_token_idx=atom_to_token_idx,
-            )  # [..., N_sample, N_atom, c_atom]
-
-            # Add the noisy positions
-            # Different from paper!!
-            q_l = c_l + self.linear_no_bias_r(r_l)  # [..., N_sample, N_atom, c_atom]
-        else:
-            q_l = c_l.clone()
-
-        # Add the combined single conditioning to the pair representation
-        c_l_q, c_l_k, _ = rearrange_qk_to_dense_trunk(
-            q=c_l,
-            k=c_l,
-            dim_q=-2,
-            dim_k=-2,
-            n_queries=self.n_queries,
-            n_keys=self.n_keys,
-            compute_mask=False,
-        )
-        if inplace_safe:
-            p_lm = p_lm + self.linear_no_bias_cl(F.relu(c_l_q[..., None, :]))
-            p_lm += self.linear_no_bias_cm(F.relu(c_l_k[..., None, :, :]))
-            p_lm += self.small_mlp(p_lm)
-        else:
-            p_lm = (
-                p_lm
-                + self.linear_no_bias_cl(F.relu(c_l_q[..., None, :]))
-                + self.linear_no_bias_cm(F.relu(c_l_k[..., None, :, :]))
-            )  # [..., (N_sample), n_blocks, n_queries, n_keys, c_atompair]
-
-            # Run a small MLP on the pair activations
-            p_lm = p_lm + self.small_mlp(p_lm)
+            p_lm, c_l = conditioned_cache
+        n_token = s.size(-2) if r_l is not None else None
+        q_l = c_l + self.linear_no_bias_r(r_l) if r_l is not None else c_l.clone()
 
         # Cross attention transformer
         q_l = self.atom_transformer(

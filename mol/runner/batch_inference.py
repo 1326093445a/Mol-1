@@ -36,7 +36,11 @@ from Bio import SeqIO
 
 from mol.config.base import configs as configs_base
 from mol.config.data import data_configs
-from mol.config.inference import inference_configs, validate_input_batching
+from mol.config.inference import (
+    inference_configs,
+    validate_context_parallel,
+    validate_input_batching,
+)
 from mol.config.model_type import model_configs
 from ml_collections.config_dict import ConfigDict
 from mol.config.parser import parse_configs
@@ -186,6 +190,9 @@ MEMORY_CHUNK_SETTINGS = {
         "Pair-transition chunk in the confidence head."
     ),
     "infer_setting.sample_diffusion_chunk_size": "Diffusion samples run together.",
+    "infer_setting.confidence_sample_chunk_size": (
+        "Confidence samples scored together (one above 2000 tokens)."
+    ),
     "infer_setting.diffusion_conditioning_row_chunk_size": (
         "Row chunk of the diffusion pair conditioning."
     ),
@@ -231,6 +238,26 @@ def memory_options(command: Any) -> Any:
     Each option is named after its config path and reaches the command as a
     keyword argument with the dots replaced by double underscores.
     """
+    for path, option_type, help_text in (
+        (
+            "infer_setting.batch_max_padding_ratio",
+            click.FloatRange(min=0),
+            "Maximum padded/actual cubic token work; 0 disables the limit.",
+        ),
+        (
+            "infer_setting.batch_max_pair_tokens",
+            click.IntRange(min=0),
+            "Maximum B * max_tokens**2 per batch; 0 disables the limit. "
+            "A larger singleton still runs.",
+        ),
+    ):
+        command = click.option(
+            f"--{path}",
+            path.replace(".", "__"),
+            type=option_type,
+            default=None,
+            help=help_text,
+        )(command)
     command = click.option(
         "--diffusion_cache_mode",
         "diffusion_cache_mode",
@@ -272,7 +299,12 @@ def memory_settings_from_options(options: Mapping[str, Any]) -> dict:
         value = options[path.replace(".", "__")]
         if value is not None:
             settings[path] = parse_chunk_size(path, value)
-    for path in ("infer_setting.dynamic_chunk_size", "diffusion_cache_mode"):
+    for path in (
+        "infer_setting.dynamic_chunk_size",
+        "diffusion_cache_mode",
+        "infer_setting.batch_max_padding_ratio",
+        "infer_setting.batch_max_pair_tokens",
+    ):
         value = options[path.replace(".", "__")]
         if value is not None:
             settings[path] = value
@@ -299,6 +331,7 @@ def get_default_runner(
     load_checkpoint_path: Optional[str] = None,
     memory_settings: Optional[Mapping[str, Any]] = None,
     batch_size: int = 1,
+    context_parallel_size: int = 1,
 ) -> InferenceRunner:
     """
     Get a default InferenceRunner with the specified configurations.
@@ -309,6 +342,7 @@ def get_default_runner(
         n_step (int): Number of diffusion steps.
         n_sample (int): Number of samples.
         batch_size (int): Independent no-MSA complexes per model forward.
+        context_parallel_size (int): Workers cooperating on each complex.
         dtype (str): Inference data type (e.g., 'bf16').
         model_name (str): Registered Mol-1 configuration.
         use_msa (bool): Whether to use MSA.
@@ -357,9 +391,11 @@ def get_default_runner(
     configs.use_seeds_in_json = use_seeds_in_json
     configs.need_atom_confidence = need_atom_confidence
     configs.batch_size = batch_size
+    configs.context_parallel_size = context_parallel_size
     apply_memory_settings(configs, memory_settings or {})
     validate_input_batching(configs)
-    if batch_size > 1:
+    validate_context_parallel(configs)
+    if context_parallel_size > 1:
         configs.triangle_multiplicative = "torch"
         configs.triangle_attention = "torch"
     if use_template:
@@ -413,6 +449,7 @@ def inference_jsons(
     load_checkpoint_path: Optional[str] = None,
     memory_settings: Optional[Mapping[str, Any]] = None,
     batch_size: int = 1,
+    context_parallel_size: int = 1,
 ) -> None:
     """
     Run inference on a single JSON file or a directory of JSON files.
@@ -426,6 +463,7 @@ def inference_jsons(
         n_step (int): Number of diffusion steps.
         n_sample (int): Number of samples.
         batch_size (int): Independent no-MSA complexes per model forward.
+        context_parallel_size (int): Workers cooperating on each complex.
         dtype (str): Data type.
         model_name (str): Registered Mol-1 configuration.
         trimul_kernel (str): Kernel for triangle multiplicative.
@@ -485,8 +523,22 @@ def inference_jsons(
         need_atom_confidence=need_atom_confidence,
         memory_settings=memory_settings,
         batch_size=batch_size,
+        context_parallel_size=context_parallel_size,
     )
     configs = runner.configs
+    if context_parallel_size > 1:
+        # No external preprocessing in this mode. All workers visit the exact
+        # same files in the same order and fail together on any error.
+        try:
+            for infer_json in sorted(infer_jsons):
+                configs.input_json_path = infer_json
+                infer_predict(runner, configs)
+        finally:
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        return
     for infer_json in tqdm.tqdm(infer_jsons):
         try:
             configs["input_json_path"] = preprocess_input(
@@ -586,6 +638,11 @@ def mol_cli() -> None:
     help="Independent complexes per GPU forward; values above 1 require no MSA/templates.",
 )
 @click.option("-d", "--dtype", type=str, default="bf16", help="Inference dtype.")
+@click.option(
+    "--context_parallel_size", type=click.IntRange(min=1), default=1,
+    help=("Ranks cooperating on one complex; match torchrun --nproc_per_node. "
+          "Requires no MSA/templates and batch_size=1."),
+)
 @click.option(
     "--device",
     type=str,
@@ -774,6 +831,7 @@ def predict(
     nhmmer_n_cpu: Optional[int] = None,
     load_checkpoint_path: Optional[str] = None,
     batch_size: int = 1,
+    context_parallel_size: int = 1,
     **memory_args: Any,
 ) -> None:
     """
@@ -787,6 +845,7 @@ def predict(
         step (int): Number of diffusion steps.
         sample (int): Number of samples.
         batch_size (int): Independent no-MSA complexes per model forward.
+        context_parallel_size (int): Workers cooperating on each complex.
         dtype (str): Data type.
         model_name (str): Registered Mol-1 configuration.
         use_msa (bool): Use MSA.
@@ -894,6 +953,7 @@ def predict(
         nhmmer_n_cpu=nhmmer_n_cpu,
         memory_settings=memory_settings,
         batch_size=batch_size,
+        context_parallel_size=context_parallel_size,
     )
 
 

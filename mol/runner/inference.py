@@ -35,7 +35,11 @@ from biotite.structure import AtomArray
 
 from mol.config.base import configs as configs_base
 from mol.config.data import data_configs
-from mol.config.inference import inference_configs, validate_input_batching
+from mol.config.inference import (
+    inference_configs,
+    validate_context_parallel,
+    validate_input_batching,
+)
 from mol.config.model_type import model_configs
 from mol.config.parser import parse_configs, parse_sys_args
 from mol.data.inference.infer_dataloader import get_inference_dataloader
@@ -61,10 +65,11 @@ class InferenceRunner(object):
 
     def __init__(self, configs: Any) -> None:
         validate_input_batching(configs)
-        if configs.get("batch_size", 1) > 1:
+        validate_context_parallel(configs)
+        if configs.get("context_parallel_size", 1) > 1:
             configs.triangle_multiplicative = "torch"
             configs.triangle_attention = "torch"
-            logger.info("Independent-input batching uses PyTorch triangle kernels.")
+            logger.info("Context parallel inference uses PyTorch triangle kernels.")
         self.configs = configs
         self.init_env()
         self.init_basics()
@@ -96,8 +101,17 @@ class InferenceRunner(object):
             torch.cuda.set_device(self.device)
         logging.info(f"Inference device: {self.device} (requested {requested!r})")
 
-        if DIST_WRAPPER.world_size > 1:
-            dist.init_process_group(backend="nccl")
+        if DIST_WRAPPER.world_size > 1 and not dist.is_initialized():
+            from datetime import timedelta
+
+            dist.init_process_group(
+                backend="nccl" if self.use_cuda else "gloo",
+                timeout=timedelta(minutes=5),
+            )
+        if self.configs.get("context_parallel_size", 1) > 1:
+            # Establish the communicator before spending time loading weights.
+            probe = torch.ones((), device=self.device)
+            dist.all_reduce(probe)
 
         use_fastlayernorm = os.getenv("LAYERNORM_TYPE", "fast_layernorm")
         if use_fastlayernorm == "fast_layernorm":
@@ -197,11 +211,18 @@ class InferenceRunner(object):
 
         enable_amp = (
             torch.autocast(device_type="cuda", dtype=eval_precision)
-            if torch.cuda.is_available()
+            if self.device.type == "cuda" and eval_precision != torch.float32
             else nullcontext()
         )
         data = to_device(data, self.device)
-        with enable_amp:
+        from mol.model.context_parallel import context_parallel
+
+        parallel = (
+            context_parallel()
+            if self.configs.get("context_parallel_size", 1) > 1
+            else nullcontext()
+        )
+        with enable_amp, parallel as context:
             prediction, _, _ = self.model(
                 input_feature_dict=data["input_feature_dict"],
                 label_full_dict=None,
@@ -209,6 +230,8 @@ class InferenceRunner(object):
                 mode="inference",
                 mc_dropout_apply_rate=self.configs.mc_dropout_apply_rate,
             )
+        if context is not None:
+            self.last_context_parallel_stats = context.stats
         return prediction
 
     def print(self, msg: str) -> None:
@@ -316,6 +339,13 @@ def resolve_checkpoint(configs: Any) -> str:
     default_path = opjoin(configs.load_checkpoint_dir, f"{configs.model_name}.pt")
     if os.path.isfile(default_path):
         return default_path
+
+    if getattr(configs, "context_parallel_size", 1) > 1:
+        raise FileNotFoundError(
+            f"Context-parallel inference needs a cached checkpoint at {default_path}. "
+            "Prepare it with a single-process run first, or pass --load_checkpoint_path; "
+            "workers must not concurrently download the same checkpoint."
+        )
 
     os.makedirs(configs.load_checkpoint_dir, exist_ok=True)
     source_url = checkpoint_url(configs.model_name)
@@ -581,6 +611,10 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
         runner (InferenceRunner): The initialized runner instance.
         configs (Any): Inference configurations.
     """
+    if getattr(configs, "context_parallel_size", 1) > 1:
+        from mol.runner.context_parallel_prediction import infer_predict_context_parallel
+
+        return infer_predict_context_parallel(runner, configs)
     if getattr(configs, "batch_size", 1) > 1:
         from mol.runner.batched_prediction import infer_predict_batched
 
@@ -747,7 +781,11 @@ def main(configs: Any) -> None:
         configs (Any): Inference configurations.
     """
     runner = InferenceRunner(configs)
-    infer_predict(runner, configs)
+    try:
+        infer_predict(runner, configs)
+    finally:
+        if configs.get("context_parallel_size", 1) > 1 and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def update_gpu_compatible_configs(configs: Any) -> Any:
@@ -844,6 +882,7 @@ def run() -> None:
         f"efficient_fusion={configs.enable_efficient_fusion}, tf32={configs.enable_tf32}"
     )
     validate_input_batching(configs)
+    validate_context_parallel(configs)
     download_inference_cache(configs)
     main(configs)
 

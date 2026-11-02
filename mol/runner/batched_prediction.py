@@ -76,6 +76,19 @@ def _job_seeds(job, configs):
     return list(dict.fromkeys(seeds))
 
 
+def _exceeds_batch_budget(lengths, settings):
+    """Limit padding from actual featurized token counts, not sequence estimates."""
+    if len(lengths) < 2:
+        return False
+    maximum = max(lengths)
+    pair_budget = settings.get("batch_max_pair_tokens", 0)
+    ratio = settings.get("batch_max_padding_ratio", 0.0)
+    return bool(
+        (pair_budget and len(lengths) * maximum**2 > pair_budget)
+        or (ratio and len(lengths) * maximum**3 > ratio * sum(n**3 for n in lengths))
+    )
+
+
 def infer_predict_batched(runner, configs):
     from mol.runner.inference import (
         fix_cterminal_carboxyl_oxygens,
@@ -195,7 +208,8 @@ def infer_predict_batched(runner, configs):
                     torch.cuda.max_memory_allocated(runner.device) / 2**30,
                 )
         del predictions
-        cleanup()
+        # Keep the CUDA allocator warm for the next batch. OOM recovery above
+        # still releases cached blocks before retrying a smaller batch.
 
     def estimated_size(index):
         return sum(
@@ -219,7 +233,12 @@ def infer_predict_batched(runner, configs):
                 report(data, seed, error)
                 continue
             current = _precision_bucket(int(data["N_token"].item()))
-            if pending and current != bucket:
+            lengths = [int(item[0]["N_token"].item()) for item in pending]
+            lengths.append(int(data["N_token"].item()))
+            if pending and (
+                current != bucket
+                or _exceeds_batch_budget(lengths, configs.infer_setting)
+            ):
                 predict(pending)
                 pending = []
             bucket = current
