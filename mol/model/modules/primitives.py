@@ -270,6 +270,48 @@ class Transition(nn.Module):
             return outputs
 
 
+def _attention_4d(q, k, v, attn_bias):
+    """Expose batch/head axes to SDPA without expanding a shared pair bias.
+
+    Leading axes describe independent attention problems. When a bias is
+    shared across only some of them (e.g. [B, 1, H, Q, K] for B x S samples),
+    visit the outer axis and retain the broadcast inside each 4D call. A
+    flattened expanded bias would otherwise allocate S copies of every pair.
+    """
+    shape = q.shape[:-1] + (v.shape[-1],)
+    if q.ndim > 4 and attn_bias is not None and attn_bias.ndim > 3:
+        attn_bias = attn_bias.view(
+            (1,) * (q.ndim - attn_bias.ndim) + attn_bias.shape
+        )
+        prefix = attn_bias.shape[:-3]
+        flat_bias = None
+        if prefix == q.shape[:-3] or all(n == 1 for n in prefix):
+            try:
+                # view, not reshape: never materialize a broadcast pair bias.
+                flat_bias = attn_bias.view(-1, *attn_bias.shape[-3:])
+            except RuntimeError:
+                pass
+        if flat_bias is None:
+            return torch.stack(
+                [
+                    _attention_4d(
+                        q[i], k[i], v[i],
+                        attn_bias[0 if attn_bias.shape[0] == 1 else i],
+                    )
+                    for i in range(q.shape[0])
+                ]
+            )
+        attn_bias = flat_bias
+    output = F.scaled_dot_product_attention(
+        q.reshape(-1, *q.shape[-3:]),
+        k.reshape(-1, *k.shape[-3:]),
+        v.reshape(-1, *v.shape[-3:]),
+        attn_mask=attn_bias,
+        scale=1.0,
+    )
+    return output.reshape(shape)
+
+
 def _attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -309,6 +351,31 @@ def _attention(
         # dtype the way the branch below does, so the result can feed
         # low-precision layers. Both casts are no-ops on the paths above.
         v = v.to(dtype=torch.float32)
+        if (
+            q.is_cuda
+            and input_dtype == torch.float32
+            and not torch.is_grad_enabled()
+            and not torch.is_autocast_enabled("cuda")
+            and q.ndim >= 3
+            and q.ndim != 4
+            and q.shape[:-2] == k.shape[:-2]
+            and q.numel() > 0
+            and k.numel() > 0
+            and (
+                attn_bias is None
+                or (
+                    attn_bias.ndim <= q.ndim
+                    and all(
+                        b in (1, n)
+                        for b, n in zip(
+                            (1,) * (q.ndim - attn_bias.ndim) + attn_bias.shape,
+                            q.shape[:-1] + (k.shape[-2],),
+                        )
+                    )
+                )
+            )
+        ):
+            return _attention_4d(q, k, v, attn_bias)
         attn_output = F.scaled_dot_product_attention(
             query=q,
             key=k,

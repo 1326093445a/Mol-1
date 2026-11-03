@@ -221,3 +221,97 @@ The unchanged code in this environment already differs from singleton inference
 by 0.00356 angstrom RMS / 0.0171 angstrom maximum on the shortest checkpoint
 fixture; the checkpoint regression accounts for that measured baseline and also
 checks exact repeated-batch reproducibility.
+
+## FP32 attention layout validation on real inputs
+
+FP32 CUDA inference now exposes four-dimensional batch/head axes to PyTorch
+scaled-dot-product attention. This lets the mixed-input diffusion transformer
+use efficient attention instead of the math backend. Biases shared across the
+five samples retain their original storage: the helper processes each input
+separately when flattening would require materializing repeated pair biases.
+CPU, gradient-enabled execution and BF16 autocast retain the existing path.
+PyTorch still chooses the supported attention backend for each call.
+
+Validation on 2026-11-03 used the `mol1` environment (Torch 2.13.0+cu130), H200s,
+the released checkpoint, TMK3 multiplication, cuEquivariance triangle attention,
+PyTorch LayerNorm and TF32 disabled. Both implementations used **five samples,
+ten recycles and 200 diffusion steps**, with BF16 trunk and FP32 diffusion and
+confidence. The real 9fm7 fixture retained both protein chains and both ligands
+(644 tokens); the mixed-length batch added the real 8cnh-assembly1 fixture
+(509 tokens). MSA and templates were disabled.
+
+Each comparison used the same loaded model and prepared inputs, warmed both
+implementations, then measured baseline/optimized/optimized/baseline. These are
+medians of two timed runs per implementation, including input copying, transfer,
+inference and confidence summaries. Featurization, native ipSAE calculation,
+output validation and writing are outside the timed region.
+
+| Real input | Deterministic algorithms | Baseline seconds | 4D attention seconds | Time reduction |
+| --- | --- | ---: | ---: | ---: |
+| 9fm7 alone | Enabled | 35.44 | 35.37 | 0.2% (no meaningful gain) |
+| 9fm7 + 8cnh | Enabled | 68.76 | 66.72 | 3.0% |
+| 9fm7 + 8cnh | Disabled | 65.17 | 63.03 | 3.3% |
+
+Peak allocated GPU memory was unchanged between timed implementations:
+43.55 GiB for the singleton and 44.46 GiB for the batch. A singleton's token
+attention already has four dimensions, so the main improvement is specific to
+mixed-input batching. This experiment does not establish a speedup for other
+lengths, devices or a complete production queue.
+
+In the controlled runs, each implementation repeated bitwise identically.
+Comparing old versus new attention, all five 9fm7 `ipsae_min_10` values and sample
+rankings matched exactly in both singleton and batched execution. Batched 9fm7
+coordinate RMSE was 0.000063 angstrom, maximum component difference 0.00173
+angstrom, and maximum CA-aligned RMSD across samples 0.000099 angstrom. PAE
+maximum difference was 0.00787 angstrom. Coordinates and PAE are therefore **not
+bitwise identical**. The companion 8cnh case had coordinate RMSE 0.00261 angstrom,
+maximum component difference 0.422 angstrom and maximum CA-aligned RMSD 0.00515
+angstrom; rankings matched. Its ipSAE is null because it has one protein chain.
+Before/after CIFs, summary JSONs and full-precision comparison tensors are saved.
+
+The ordinary-mode timing run is unsuitable for claiming numerical equivalence:
+repeating the unchanged baseline already changed 9fm7 ipSAE by up to 0.02581 and
+changed sample rankings. The optimized implementation also varied across
+repeats. The cause of that existing nondeterminism was not isolated in this
+change. Exact ipSAE agreement above is limited to the controlled real-example
+test, not a guarantee for arbitrary predictions or ordinary-mode repeated runs.
+
+Reproduce the comparison using a saved baseline helper from revision `8c3c5e5`:
+
+```bash
+git show 8c3c5e5:mol/model/modules/primitives.py > /tmp/mol1_attention_baseline.py
+conda activate mol1
+MOL_ROOT_DIR=/storage/frank/mol1_root LAYERNORM_TYPE=torch \
+  CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+  python scripts/validate_attention_9fm7.py \
+  --case batch --deterministic \
+  --baseline-source /tmp/mol1_attention_baseline.py \
+  --checkpoint /storage/frank/mol1_root/checkpoint/mol-1-base.pt \
+  --output output/attention_9fm7
+```
+
+Use `--case single` for 9fm7 alone; omit `--deterministic` for ordinary settings.
+The validation script fixes samples/cycles/steps at 5/10/200 and records active
+model precision settings. No MSA or template search is performed.
+
+The aggregate local report is `output/mol1_attention_9fm7_report.json`, with
+individual reports, original logs, prediction artifacts and corrections in
+`output/mol1_attention_9fm7_validation/`. The original measurement driver's final
+console print failed to serialize tensors after saving all completed results.
+The maintained script fixes that print, uses boolean CA masks for alignment and
+reports the model's active precision configuration. Corrected alignment metrics
+were recomputed from the saved tensors; timings and native ipSAE were unaffected.
+
+Validation preserved all previously passing tests. The full non-network CPU
+suite retains three existing pandas vectorization failures (`test_all_nan`,
+`test_basic`, `test_with_nan`), reproduced on the unmodified revision. GPU
+regressions passed 93 tests (19 opt-in tests skipped); separately enabling the
+batch/TMK3 kernel tests passed 30 tests and 80 subtests. Run the suite explicitly
+under `tests/` so local archived experiments in `output/` are not collected:
+
+```bash
+LAYERNORM_TYPE=torch PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  python -m pytest tests -m 'not network' -q
+MOL_RUN_BATCH_KERNEL_TESTS=1 TEST_FLASHPAIRFORMER_CUDA=1 LAYERNORM_TYPE=torch \
+  python -m pytest tests/test_batch_optimizations.py tests/test_flashpairformer.py -q
+```
