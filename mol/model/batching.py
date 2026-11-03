@@ -226,6 +226,7 @@ def _denoise_batch(
             p_lm=cache["p_lm/c_l"][0],
             c_l=cache["p_lm/c_l"][1],
             conditioned_cache=cache.get("conditioned_atom"),
+            atom_transformer_cache=cache.get("atom_encoder_blocks"),
             inplace_safe=True,
             chunk_size=chunk_size,
         )
@@ -262,6 +263,7 @@ def _denoise_batch(
             q_skip=skip[0],
             c_skip=skip[1],
             p_skip=skip[2],
+            atom_transformer_cache=states[i][4].get("atom_decoder_blocks"),
             inplace_safe=True,
             chunk_size=chunk_size,
         )
@@ -432,6 +434,15 @@ def forward_batch(model, features: list[dict[str, Any]], seeds: list[int]):
                         inplace_safe=True,
                     )
                 )
+                if cfg.infer_setting.get("atom_block_cache", False):
+                    atom_pair, atom_single = local_cache["conditioned_atom"]
+                    for name, module in (
+                        ("atom_encoder_blocks", model.diffusion_module.atom_attention_encoder),
+                        ("atom_decoder_blocks", model.diffusion_module.atom_attention_decoder),
+                    ):
+                        local_cache[name] = module.atom_transformer.prepare_inference_cache(
+                            atom_single, atom_pair
+                        )
             static_pair = pad_token_tensors(
                 [
                     state[4]["pair_z"].float()

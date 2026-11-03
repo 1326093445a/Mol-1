@@ -58,13 +58,14 @@ def main():
     p.add_argument("--case", choices=["single", "batch"], required=True)
     p.add_argument("--deterministic", action="store_true")
     p.add_argument(
-        "--comparison", choices=["attention", "aggregation"], default="attention"
+        "--comparison",
+        choices=["attention", "aggregation", "atom-cache"],
+        default="attention",
     )
     p.add_argument(
         "--baseline-source",
         type=Path,
-        required=True,
-        help="Baseline primitives.py (attention) or model/utils.py (aggregation).",
+        help="Baseline primitives.py (attention) or model/utils.py (aggregation); unused for atom-cache.",
     )
     p.add_argument(
         "--checkpoint",
@@ -74,8 +75,12 @@ def main():
     )
     p.add_argument("--output", type=Path, required=True)
     a = p.parse_args()
-    if not a.baseline_source.is_file() or not a.checkpoint.is_file():
-        p.error("--baseline-source and --checkpoint must be existing local files")
+    if not a.checkpoint.is_file():
+        p.error("--checkpoint must be an existing local file")
+    if a.comparison != "atom-cache" and (
+        a.baseline_source is None or not a.baseline_source.is_file()
+    ):
+        p.error("--baseline-source must be an existing local file for this comparison")
     if a.deterministic:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     root = Path(__file__).resolve().parents[1]
@@ -85,17 +90,25 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.use_deterministic_algorithms(a.deterministic)
-    base_spec = importlib.util.spec_from_file_location(
-        "baseline_primitives", a.baseline_source
-    )
-    base = importlib.util.module_from_spec(base_spec)
-    base_spec.loader.exec_module(base)
-    target, function, source = (
-        (primitives, "_attention", "mol/model/modules/primitives.py")
-        if a.comparison == "attention"
-        else (transformer, "aggregate_atom_to_token", "mol/model/utils.py")
-    )
-    original = getattr(base, function)
+    if a.comparison == "atom-cache":
+        target = transformer.AtomTransformer
+        function = "prepare_inference_cache"
+        source = "mol/model/modules/transformer.py"
+
+        def original(self, c, p):
+            return None
+    else:
+        base_spec = importlib.util.spec_from_file_location(
+            "baseline_module", a.baseline_source
+        )
+        base = importlib.util.module_from_spec(base_spec)
+        base_spec.loader.exec_module(base)
+        target, function, source = (
+            (primitives, "_attention", "mol/model/modules/primitives.py")
+            if a.comparison == "attention"
+            else (transformer, "aggregate_atom_to_token", "mol/model/utils.py")
+        )
+        original = getattr(base, function)
     optimized = getattr(target, function)
     jobs = [
         json.loads(
@@ -128,6 +141,7 @@ def main():
             memory_settings={
                 "infer_setting.sample_diffusion_chunk_size": 5,
                 "infer_setting.confidence_sample_chunk_size": 5,
+                "infer_setting.atom_block_cache": a.comparison == "atom-cache",
             },
         )
     runner.configs.input_json_path = str(inputs)
@@ -176,13 +190,23 @@ def main():
             skip_amp=dict(runner.model.configs.skip_amp),
             diffusion_chunk=5,
             confidence_chunk=5,
+            atom_block_cache=runner.model.configs.infer_setting.atom_block_cache,
             multiplication="flashpairformer",
             attention="cuequivariance",
             tf32=False,
             use_msa=False,
             use_template=False,
         ),
-        baseline_sha256=hashlib.sha256((a.baseline_source).read_bytes()).hexdigest(),
+        baseline_sha256=(
+            None
+            if a.comparison == "atom-cache"
+            else hashlib.sha256(a.baseline_source.read_bytes()).hexdigest()
+        ),
+        baseline_description=(
+            "Same code with AtomTransformer.prepare_inference_cache returning None"
+            if a.comparison == "atom-cache"
+            else str(a.baseline_source)
+        ),
         optimized_sha256=hashlib.sha256((root / source).read_bytes()).hexdigest(),
         runs=[],
         comparisons={},

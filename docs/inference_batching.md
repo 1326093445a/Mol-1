@@ -359,3 +359,76 @@ Local artifacts are in `output/mol1_repro_validation/`. GPU sharing began after
 the devices were checked and before the model runs finished. The timings are
 retained as shared-GPU observations, not evidence of a speedup. Correctness
 comparisons use the saved full-precision tensors and native summary values.
+
+## Reusing fixed atom-block conditioning
+
+An opt-in cache prepares the encoder and decoder atom blocks' fixed
+pair-bias projections, adaptive LayerNorm affine terms and output gates once
+per input during mixed-input diffusion. Each denoising step still computes attention on the changing atom
+representations. The cache is local to one prediction request, shared across
+sample chunks, and never registered on the model or checkpoint. It is enabled
+with `--infer_setting.atom_block_cache true` and the existing `full` or `shared`
+diffusion-cache modes; its default is **false**, and `off` retains the
+uncached path. Gradient-enabled execution and training ignore the cache.
+
+This change currently applies to `predict_batch`, including a partial batch of
+one input. The ordinary singleton prediction path is unchanged. Fixed local
+attention masks are still rebuilt; this optimization caches projections and
+conditioning, not those masks.
+
+Compare cached and uncached execution while keeping the same attention helper,
+stable atom aggregation, checkpoint and precision settings:
+
+```bash
+conda activate mol1
+MOL_ROOT_DIR=/storage/frank/mol1_root LAYERNORM_TYPE=torch \
+  CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+  python scripts/validate_attention_9fm7.py \
+  --case batch --comparison atom-cache \
+  --checkpoint /storage/frank/mol1_root/checkpoint/mol-1-base.pt \
+  --output output/atom_cache_validation
+```
+
+Add `--deterministic` for a second comparison using the existing explicitly
+deterministic aggregation path. The baseline disables only atom-block cache
+construction; the same loaded model performs both implementations.
+
+The validation command enables the cache for the optimized passes automatically.
+Local results are in `output/mol1_atomcache_validation/`. CPU/CUDA unit checks
+cover exact outputs, immutable cached tensors, different sample chunks,
+request-local construction and gradients. The combined non-network CPU suite
+passed 282 tests with the same three pandas failures (63 skipped, 27 subtests).
+CUDA regression checks passed 64 tests and 80 subtests (one skipped); a separate
+attention/aggregation/cache group passed 73 tests (13 skipped). These groups
+overlap and should not be summed.
+Final opt-in/default, aggregation and cache checks passed 44 CUDA/CLI tests and
+three subtests after the config switch was added.
+
+An interleaved component microbenchmark with five samples and 4372 atoms measured
+10.76 ms uncached versus 5.70 ms cached for the three-block atom transformer.
+It used synthetic tensors and excluded cache construction. All GPUs were shared
+with unrelated jobs, including during the real-model measurements, so these
+results do not establish a production throughput gain.
+
+In the real 9fm7/8cnh batch, all cached-versus-uncached coordinates, PAE, atom
+pLDDT, native ipSAE values and sample rankings were bitwise identical, with
+both ordinary and deterministic algorithms. All 40 before/after CIF and summary
+file pairs matched byte for byte. Peak allocated memory was 44.46 GiB in both
+implementations. Shared-GPU full-model timings were:
+
+| Settings | Uncached seconds | Cached seconds |
+| --- | ---: | ---: |
+| Ordinary | 95.63 | 96.99 |
+| Deterministic | 100.38 | 102.33 |
+
+These measurements showed no full-model gain. Caching therefore remains opt-in
+pending a measurement without competing GPU work; the component improvement
+alone is insufficient to enable it by default.
+
+The instrumented real-input trunk pass identified triangle attention as the
+largest measured substage: 20.65 s, versus 13.50 s for triangle multiplication,
+7.37 s for pair transitions and 4.97 s for the query-only MSA module. Total
+instrumented trunk time was 51.47 s. These shared-GPU measurements are for
+prioritization, not an isolated performance claim. MSA/template computation
+semantics, confidence precision, five samples and ten recycles are preserved.
+Input prefetch and background output writing remain future work.

@@ -125,7 +125,12 @@ class AdaptiveLayerNorm(nn.Module):
             in_features=c_s, out_features=c_a, initializer="zeros"
         )
 
-    def forward(self, a: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    def prepare_condition(self, s):
+        """Noise-independent affine terms for request-local inference caches."""
+        s = self.layernorm_s(s)
+        return torch.sigmoid(self.linear_s(s)), self.linear_nobias_s(s)
+
+    def forward(self, a: torch.Tensor, s: torch.Tensor, condition=None) -> torch.Tensor:
         """
         Args:
             a (torch.Tensor): the single feature aggregate per-atom representation
@@ -138,6 +143,9 @@ class AdaptiveLayerNorm(nn.Module):
                 [..., N_token, c_a]
         """
         a = self.layernorm_a(a)
+        if condition is not None and not self.training and not torch.is_grad_enabled():
+            scale, offset = condition
+            return scale * a + offset
         s = self.layernorm_s(s)
         a = torch.sigmoid(self.linear_s(s)) * a + self.linear_nobias_s(s)
         return a

@@ -38,6 +38,7 @@ class InferenceDefaultsTest(unittest.TestCase):
         self.assertEqual(configs.mc_dropout_apply_rate, 0.0)
         self.assertEqual(configs.mc_dropout_rate, 0.0)
         self.assertFalse(configs.enable_tf32)
+        self.assertFalse(configs.infer_setting.atom_block_cache)
         self.assertEqual(configs.infer_setting.sample_diffusion_chunk_size, 1)
         # The rest of infer_setting is the shared one.
         self.assertEqual(

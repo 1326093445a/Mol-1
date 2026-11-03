@@ -49,6 +49,7 @@ class PredMemoryOptionsTest(unittest.TestCase):
             "--model.msa_module.msa_chunk_size", "512",
             "--infer_setting.diffusion_conditioning_row_chunk_size", "none",
             "--infer_setting.dynamic_chunk_size", "true",
+            "--infer_setting.atom_block_cache", "true",
             "--diffusion_cache_mode", "shared",
         )
         self.assertEqual(result.exit_code, 0, result.output)
@@ -59,6 +60,7 @@ class PredMemoryOptionsTest(unittest.TestCase):
                 "model.msa_module.msa_chunk_size": 512,
                 "infer_setting.diffusion_conditioning_row_chunk_size": None,
                 "infer_setting.dynamic_chunk_size": True,
+                "infer_setting.atom_block_cache": True,
                 "diffusion_cache_mode": "shared",
             },
         )

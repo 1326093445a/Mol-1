@@ -60,6 +60,8 @@ inference_configs = {
         **base_model_configs["infer_setting"],
         "sample_diffusion_chunk_size": ValueMaybeNone(1),
         "confidence_sample_chunk_size": ValueMaybeNone(1),
+        # Opt-in until full-model throughput is measured without GPU contention.
+        "atom_block_cache": False,
         # Zero disables either scheduling limit. These never alter N_sample.
         "batch_max_padding_ratio": 0.0,
         "batch_max_pair_tokens": 0,

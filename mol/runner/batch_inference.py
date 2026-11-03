@@ -240,6 +240,11 @@ def memory_options(command: Any) -> Any:
     """
     for path, option_type, help_text in (
         (
+            "infer_setting.atom_block_cache",
+            bool,
+            "Cache fixed atom-block conditioning during input batching (default false).",
+        ),
+        (
             "infer_setting.batch_max_padding_ratio",
             click.FloatRange(min=0),
             "Maximum padded/actual cubic token work; 0 disables the limit.",
@@ -300,12 +305,13 @@ def memory_settings_from_options(options: Mapping[str, Any]) -> dict:
         if value is not None:
             settings[path] = parse_chunk_size(path, value)
     for path in (
+        "infer_setting.atom_block_cache",
         "infer_setting.dynamic_chunk_size",
         "diffusion_cache_mode",
         "infer_setting.batch_max_padding_ratio",
         "infer_setting.batch_max_pair_tokens",
     ):
-        value = options[path.replace(".", "__")]
+        value = options.get(path.replace(".", "__"))
         if value is not None:
             settings[path] = value
     return settings

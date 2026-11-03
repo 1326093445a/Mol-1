@@ -52,6 +52,18 @@ class ProjectedPairBiases:
     blocks: tuple[torch.Tensor, ...]
 
 
+@dataclass(frozen=True)
+class AtomBlockCache:
+    """Fixed atom conditioning for one block and one inference request."""
+
+    pair_bias: torch.Tensor
+    attention_condition: tuple[torch.Tensor, torch.Tensor]
+    kv_condition: tuple[torch.Tensor, torch.Tensor]
+    attention_gate: torch.Tensor
+    transition_condition: tuple[torch.Tensor, torch.Tensor]
+    transition_gate: torch.Tensor
+
+
 class AttentionPairBias(nn.Module):
     """
     Implements Algorithm 24 in AF3
@@ -181,6 +193,7 @@ class AttentionPairBias(nn.Module):
         n_keys: int = 128,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        pair_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Used by Algorithm 24, with beta_ij being the local mask. Used in AtomTransformer.
 
@@ -206,12 +219,13 @@ class AttentionPairBias(nn.Module):
         assert len(z.shape) == len(q.shape) + 2
 
         # Multi-head attention bias
-        bias = self.linear_nobias_z(
-            self.layernorm_z(z)
-        )  # [..., n_blocks, n_queries, n_keys, n_heads]
-        bias = permute_final_dims(
-            bias, [3, 0, 1, 2]
-        )  # [..., n_heads, n_blocks, n_queries, n_keys]
+        if pair_bias is None:
+            bias = self.linear_nobias_z(
+                self.layernorm_z(z)
+            )  # [..., n_blocks, n_queries, n_keys, n_heads]
+            bias = permute_final_dims(bias, [3, 0, 1, 2])
+        else:
+            bias = pair_bias
 
         # Line 11: Multi-head attention with attention bias & gating (and optionally local attention)
         q = self.attention(
@@ -327,17 +341,26 @@ class AttentionPairBias(nn.Module):
         enable_efficient_fusion: bool = False,
         pair_bias: Optional[torch.Tensor] = None,
         extra_attn_bias: Optional[torch.Tensor] = None,
+        atom_cache: Optional[AtomBlockCache] = None,
     ) -> torch.Tensor:
         """Details are given in local_forward and standard_forward"""
+        if self.training or torch.is_grad_enabled():
+            atom_cache = None
         # Input projections
         if self.has_s:
-            a = self.layernorm_a(a=a, s=s)
+            a = self.layernorm_a(
+                a=a, s=s,
+                condition=None if atom_cache is None else atom_cache.attention_condition,
+            )
         else:
             a = self.layernorm_a(a)
 
         if self.cross_attention_mode:
             if self.has_s:
-                kv = self.layernorm_kv(a=a, s=s)
+                kv = self.layernorm_kv(
+                    a=a, s=s,
+                    condition=None if atom_cache is None else atom_cache.kv_condition,
+                )
             else:
                 kv = self.layernorm_kv(a)
         else:
@@ -355,6 +378,7 @@ class AttentionPairBias(nn.Module):
                 n_keys,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
+                pair_bias=None if atom_cache is None else atom_cache.pair_bias,
             )
         else:
             a = self.standard_multihead_attention(
@@ -369,10 +393,14 @@ class AttentionPairBias(nn.Module):
 
         # Output projection (from adaLN-Zero [27])
         if self.has_s:
+            gate = (
+                torch.sigmoid(self.linear_a_last(s))
+                if atom_cache is None else atom_cache.attention_gate
+            )
             if inplace_safe:
-                a *= torch.sigmoid(self.linear_a_last(s))
+                a *= gate
             else:
-                a = torch.sigmoid(self.linear_a_last(s)) * a
+                a = gate * a
 
         return a
 
@@ -435,6 +463,7 @@ class DiffusionTransformerBlock(nn.Module):
         enable_efficient_fusion: bool = False,
         pair_bias: Optional[torch.Tensor] = None,
         extra_attn_bias: Optional[torch.Tensor] = None,
+        atom_cache: Optional[AtomBlockCache] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -470,13 +499,16 @@ class DiffusionTransformerBlock(nn.Module):
                 enable_efficient_fusion=enable_efficient_fusion,
                 pair_bias=pair_bias,
                 extra_attn_bias=extra_attn_bias,
+                atom_cache=atom_cache,
             )
         )
         if inplace_safe:
             attn_out += a
         else:
             attn_out = attn_out + a
-        ff_out = self.drop_path(self.conditioned_transition_block(a=attn_out, s=s))
+        ff_out = self.drop_path(
+            self.conditioned_transition_block(a=attn_out, s=s, atom_cache=atom_cache)
+        )
         out_a = ff_out + attn_out
         # Avoid s/z to be deleted by torch.utils.checkpoint
         return out_a, s, z
@@ -541,6 +573,7 @@ class DiffusionTransformer(nn.Module):
         enable_efficient_fusion: bool = False,
         projected_pair_biases: Optional[ProjectedPairBiases] = None,
         extra_attn_bias: Optional[torch.Tensor] = None,
+        atom_block_caches: Optional[tuple[AtomBlockCache, ...]] = None,
     ) -> list[Callable]:
         blocks = [
             partial(
@@ -551,6 +584,7 @@ class DiffusionTransformer(nn.Module):
                 chunk_size=chunk_size,
                 enable_efficient_fusion=enable_efficient_fusion,
                 extra_attn_bias=extra_attn_bias,
+                atom_cache=None if atom_block_caches is None else atom_block_caches[i],
                 pair_bias=(
                     None
                     if projected_pair_biases is None
@@ -613,6 +647,7 @@ class DiffusionTransformer(nn.Module):
         enable_efficient_fusion: bool = False,
         projected_pair_biases: Optional[ProjectedPairBiases] = None,
         extra_attn_bias: Optional[torch.Tensor] = None,
+        atom_block_caches: Optional[tuple[AtomBlockCache, ...]] = None,
     ) -> torch.Tensor:
         """Apply all Diffusion Transformer blocks.
 
@@ -637,6 +672,11 @@ class DiffusionTransformer(nn.Module):
         Returns:
             torch.Tensor: Updated representation ``[..., N, c_a]``.
         """
+        if self.training or torch.is_grad_enabled():
+            atom_block_caches = None
+        if atom_block_caches is not None:
+            if not n_queries or not n_keys or len(atom_block_caches) != self.n_blocks:
+                raise ValueError("Atom caches require one entry per local attention block")
         if projected_pair_biases is not None:
             if not isinstance(projected_pair_biases, ProjectedPairBiases):
                 raise TypeError("projected_pair_biases must be a ProjectedPairBiases")
@@ -680,6 +720,7 @@ class DiffusionTransformer(nn.Module):
             enable_efficient_fusion=enable_efficient_fusion,
             projected_pair_biases=pair_biases_for_blocks,
             extra_attn_bias=extra_attn_bias,
+            atom_block_caches=atom_block_caches,
         )
         a, s, z = checkpoint_blocks(
             blocks, args=(a, s, z), blocks_per_ckpt=blocks_per_ckpt
@@ -731,6 +772,26 @@ class AtomTransformer(nn.Module):
             blocks_per_ckpt=blocks_per_ckpt,
         )
 
+    def prepare_inference_cache(self, c, p):
+        """Project fixed conditioning once; never retain tensors on the module."""
+        if self.training or torch.is_grad_enabled():
+            return None
+        caches = []
+        for block in self.diffusion_transformer.blocks:
+            attention = block.attention_pair_bias
+            transition = block.conditioned_transition_block
+            caches.append(AtomBlockCache(
+                pair_bias=permute_final_dims(
+                    attention.linear_nobias_z(attention.layernorm_z(p)), [3, 0, 1, 2]
+                ),
+                attention_condition=attention.layernorm_a.prepare_condition(c),
+                kv_condition=attention.layernorm_kv.prepare_condition(c),
+                attention_gate=torch.sigmoid(attention.linear_a_last(c)),
+                transition_condition=transition.adaln.prepare_condition(c),
+                transition_gate=torch.sigmoid(transition.linear_s(c)),
+            ))
+        return tuple(caches)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -738,6 +799,7 @@ class AtomTransformer(nn.Module):
         p: torch.Tensor,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        inference_cache: Optional[tuple[AtomBlockCache, ...]] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -764,6 +826,7 @@ class AtomTransformer(nn.Module):
             n_keys=self.n_keys,
             inplace_safe=inplace_safe,
             chunk_size=chunk_size,
+            atom_block_caches=inference_cache,
         )
 
 
@@ -795,7 +858,7 @@ class ConditionedTransitionBlock(nn.Module):
             in_features=c_s, out_features=c_a, bias=True, biasinit=biasinit
         )
 
-    def forward(self, a: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    def forward(self, a: torch.Tensor, s: torch.Tensor, atom_cache=None) -> torch.Tensor:
         """
         Args:
             a (torch.Tensor): the single feature aggregate per-atom representation
@@ -807,10 +870,18 @@ class ConditionedTransitionBlock(nn.Module):
             torch.Tensor: the updated a from ConditionedTransitionBlock
                 [..., N, c_a]
         """
-        a = self.adaln(a, s)
+        if self.training or torch.is_grad_enabled():
+            atom_cache = None
+        a = self.adaln(
+            a, s, condition=None if atom_cache is None else atom_cache.transition_condition
+        )
         b = F.silu((self.linear_nobias_a1(a))) * self.linear_nobias_a2(a)
         # Output projection (from adaLN-Zero [27])
-        a = torch.sigmoid(self.linear_s(s)) * self.linear_nobias_b(b)
+        gate = (
+            torch.sigmoid(self.linear_s(s))
+            if atom_cache is None else atom_cache.transition_gate
+        )
+        a = gate * self.linear_nobias_b(b)
         return a
 
 
@@ -1085,6 +1156,7 @@ class AtomAttentionEncoder(nn.Module):
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
         conditioned_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        atom_transformer_cache: Optional[tuple[AtomBlockCache, ...]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -1149,7 +1221,8 @@ class AtomAttentionEncoder(nn.Module):
 
         # Cross attention transformer
         q_l = self.atom_transformer(
-            q_l, c_l, p_lm, chunk_size=chunk_size
+            q_l, c_l, p_lm, chunk_size=chunk_size,
+            inference_cache=atom_transformer_cache,
         )  # [..., (N_sample), N_atom, c_atom]
 
         # Aggregate per-atom representation to per-token representation
@@ -1220,6 +1293,7 @@ class AtomAttentionDecoder(nn.Module):
         p_skip: torch.Tensor,
         inplace_safe: bool = False,
         chunk_size: Optional[int] = None,
+        atom_transformer_cache: Optional[tuple[AtomBlockCache, ...]] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -1249,7 +1323,8 @@ class AtomAttentionDecoder(nn.Module):
 
         # Cross attention transformer
         q = self.atom_transformer(
-            q, c_skip, p_skip, inplace_safe=inplace_safe, chunk_size=chunk_size
+            q, c_skip, p_skip, inplace_safe=inplace_safe, chunk_size=chunk_size,
+            inference_cache=atom_transformer_cache,
         )
 
         # Map to positions update
