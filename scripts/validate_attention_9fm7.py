@@ -1,6 +1,6 @@
 # Copyright 2026 Molence Bio
 # SPDX-License-Identifier: Apache-2.0
-"""Compare baseline/current attention on real examples with fixed inference settings."""
+"""Compare inference implementations on real examples with fixed sampling settings."""
 
 import argparse
 import copy
@@ -19,7 +19,7 @@ import torch
 from mol.config.inference import inference_configs
 from mol.data.inference.infer_dataloader import InferenceDataset
 from mol.metrics.ipsae import ipsae_summary, protein_token_groups
-from mol.model.modules import primitives
+from mol.model.modules import primitives, transformer
 from mol.runner.batch_inference import get_default_runner
 from mol.runner.batched_prediction import validate_prediction
 from mol.runner.inference import (
@@ -58,10 +58,13 @@ def main():
     p.add_argument("--case", choices=["single", "batch"], required=True)
     p.add_argument("--deterministic", action="store_true")
     p.add_argument(
+        "--comparison", choices=["attention", "aggregation"], default="attention"
+    )
+    p.add_argument(
         "--baseline-source",
         type=Path,
         required=True,
-        help="Unmodified primitives.py from the comparison revision.",
+        help="Baseline primitives.py (attention) or model/utils.py (aggregation).",
     )
     p.add_argument(
         "--checkpoint",
@@ -87,8 +90,13 @@ def main():
     )
     base = importlib.util.module_from_spec(base_spec)
     base_spec.loader.exec_module(base)
-    original = base._attention
-    optimized = primitives._attention
+    target, function, source = (
+        (primitives, "_attention", "mol/model/modules/primitives.py")
+        if a.comparison == "attention"
+        else (transformer, "aggregate_atom_to_token", "mol/model/utils.py")
+    )
+    original = getattr(base, function)
+    optimized = getattr(target, function)
     jobs = [
         json.loads(
             (root / "examples/examples_with_template/example_9fm7.json").read_text()
@@ -154,6 +162,7 @@ def main():
     ]
     report = dict(
         case=a.case,
+        comparison=a.comparison,
         deterministic=a.deterministic,
         samples=5,
         cycles=10,
@@ -174,9 +183,7 @@ def main():
             use_template=False,
         ),
         baseline_sha256=hashlib.sha256((a.baseline_source).read_bytes()).hexdigest(),
-        optimized_sha256=hashlib.sha256(
-            (root / "mol/model/modules/primitives.py").read_bytes()
-        ).hexdigest(),
+        optimized_sha256=hashlib.sha256((root / source).read_bytes()).hexdigest(),
         runs=[],
         comparisons={},
     )
@@ -255,7 +262,7 @@ def main():
         "optimized_2",
         "baseline_2",
     ]:
-        primitives._attention = original if "baseline" in label else optimized
+        setattr(target, function, original if "baseline" in label else optimized)
         seed_everything(101, deterministic=a.deterministic)
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
@@ -302,7 +309,7 @@ def main():
                         summary=cpu(pred["summary_confidence"]),
                     )
                 )
-            if a.deterministic and label in ["baseline_1", "optimized_1"]:
+            if label in ["baseline_1", "optimized_1"]:
                 runner.dumper.base_dir = str(out / label)
                 runner.dumper.dump(
                     dataset_name="",

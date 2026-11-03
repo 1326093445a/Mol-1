@@ -268,6 +268,24 @@ def broadcast_token_to_atom(
     )
 
 
+def _aggregate_atom_to_token_grouped(x_atom, atom_to_token_idx, n_token, reduce):
+    """Reduce each token in atom order, without unordered floating-point atomics."""
+    order = torch.argsort(atom_to_token_idx, stable=True)
+    lengths = torch.bincount(atom_to_token_idx, minlength=n_token or 0)
+    if n_token is not None and lengths.numel() != n_token:
+        raise RuntimeError("atom_to_token_idx exceeds n_token")
+    out = torch.segment_reduce(
+        x_atom.index_select(-2, order),
+        "sum",
+        lengths=lengths.expand(*x_atom.shape[:-2], -1),
+        axis=x_atom.ndim - 2,
+    )
+    if reduce == "mean":
+        # Preserve sum-then-divide and the caller's dtype, including empty tokens.
+        out = out / lengths.clamp_min(1).to(out.dtype).unsqueeze(-1)
+    return out
+
+
 def aggregate_atom_to_token(
     x_atom: torch.Tensor,
     atom_to_token_idx: torch.Tensor,
@@ -289,7 +307,25 @@ def aggregate_atom_to_token(
             [..., N_token, d]
     """
 
-    # Broadcasting in the given dim.
+    if (
+        x_atom.is_cuda
+        and not torch.is_grad_enabled()
+        and x_atom.is_floating_point()
+        and atom_to_token_idx.ndim == 1
+        and atom_to_token_idx.numel() == x_atom.shape[-2]
+        and atom_to_token_idx.numel() > 0
+        and reduce in {"sum", "mean"}
+        and not torch.are_deterministic_algorithms_enabled()
+    ):
+        # Atomic scatter sums can change BF16 embeddings enough to alter the
+        # recycled trunk even with fixed RNG seeds. Keep a fixed atom order for
+        # ordinary inference without changing process-global determinism flags.
+        # Explicit deterministic mode retains its existing PyTorch arithmetic.
+        return _aggregate_atom_to_token_grouped(
+            x_atom, atom_to_token_idx, n_token, reduce
+        )
+
+    # Broadcasting in the given dim. Preserve CPU, training and generic layouts.
     out = scatter(
         src=x_atom, index=atom_to_token_idx, dim=-2, dim_size=n_token, reduce=reduce
     )

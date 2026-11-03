@@ -315,3 +315,47 @@ LAYERNORM_TYPE=torch PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 MOL_RUN_BATCH_KERNEL_TESTS=1 TEST_FLASHPAIRFORMER_CUDA=1 LAYERNORM_TYPE=torch \
   python -m pytest tests/test_batch_optimizations.py tests/test_flashpairformer.py -q
 ```
+
+## Stable atom aggregation during CUDA inference
+
+The ordinary-mode variability reported above was traced to atom-to-token
+averaging. On real 9fm7 features the input atom embeddings were bitwise identical
+across calls, but CUDA `scatter_add_` changed the resulting BF16 averages by up
+to 0.005859375. Fixed RNG seeds do not fix floating-point atomic addition order;
+these differences can grow through ten recycles of the BF16 trunk.
+
+CUDA inference now groups atoms by token using a stable sort and performs a
+segmented sum followed by division in the existing dtype. This gives each token
+a fixed atom order without changing global PyTorch determinism settings. The
+change covers ordinary no-gradient sum/mean aggregation with a shared 1D atom
+map. CPU execution, gradients, generic batched maps and explicitly enabled
+deterministic algorithms retain their existing paths. Missing tokens remain
+zero. No model precision or sampling parameters were changed.
+
+Both standalone 9fm7 and the mixed 9fm7/8cnh batch, using five samples, ten
+recycles and 200 steps, repeated coordinates, PAE, atom pLDDT, native ipSAE and
+rankings bitwise exactly with global deterministic algorithms disabled. Those
+saved tensors also matched the earlier deterministic 4D-attention references
+exactly (8cnh has no protein-protein ipSAE). The unchanged ordinary
+baseline still varied across repeats. This fix can therefore change historical
+ordinary-mode predictions; it does not promise to reproduce a particular
+nondeterministic run or establish prediction accuracy.
+
+Reproduce this comparison by substituting the aggregation helper:
+
+```bash
+git show 5059413:mol/model/utils.py > /tmp/mol1_aggregation_baseline.py
+conda activate mol1
+MOL_ROOT_DIR=/storage/frank/mol1_root LAYERNORM_TYPE=torch \
+  CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+  python scripts/validate_attention_9fm7.py \
+  --case batch --comparison aggregation \
+  --baseline-source /tmp/mol1_aggregation_baseline.py \
+  --checkpoint /storage/frank/mol1_root/checkpoint/mol-1-base.pt \
+  --output output/aggregation_validation
+```
+
+Local artifacts are in `output/mol1_repro_validation/`. GPU sharing began after
+the devices were checked and before the model runs finished. The timings are
+retained as shared-GPU observations, not evidence of a speedup. Correctness
+comparisons use the saved full-precision tensors and native summary values.
