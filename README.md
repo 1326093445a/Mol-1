@@ -24,7 +24,7 @@
 [![Slack](https://img.shields.io/badge/Slack-Join-4A154B?logo=slack)](https://join.slack.com/t/molence/shared_invite/zt-4ef45vmn5-X9~YKJRQFhb8zEkZ0HP9Iw)
 [![Email](https://img.shields.io/badge/Email-Contact-orange?logo=gmail)](mailto:contact@molence.com) \
 [![Wechat Official Account](https://img.shields.io/badge/Wechat_Official_Account-Follow-brightgreen?logo=wechat)](assets/images/wechat-official-account.png)
-[![Wechat](https://img.shields.io/badge/Wechat_Group-Join-brightgreen?logo=wechat)](assets/images/wechat-group.jpg)
+[![Wechat](https://img.shields.io/badge/Wechat_Group-Join-brightgreen?logo=wechat)](assets/images/wechat-group-3.png)
 
 </div>
 
@@ -272,12 +272,8 @@ mark comprising 172 interface clusters from 150 PDB entries.** (a)–(c) Success
 
 ## Acknowledgements
 
-Mol-1 is derived from [Protenix](https://github.com/bytedance/Protenix). Protenix builds on the
-AlphaFold 3 ecosystem, including AlphaFold 3, OpenFold and ColabFold. Original copyright
-notices and license headers are kept in every file derived from it, and files
-changed here say so and name the upstream revision they came from.
-Third-party components and their licenses are listed in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Third-party attributions and license information are provided in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). 
+
 
 ## Citation
 
