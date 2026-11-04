@@ -184,6 +184,7 @@ def infer_predict_batched(runner, configs):
                         seed=seed,
                         pred_dict=pred,
                         atom_array=atom_array,
+                        ipsae_interface=data.get("ipsae_interface"),
                         entity_poly_type={
                             k: v
                             for k, v in data["entity_poly_type"].items()

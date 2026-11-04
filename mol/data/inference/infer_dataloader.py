@@ -35,6 +35,7 @@ from mol.data.msa.msa_featurizer import InferenceMSAFeaturizer
 from mol.data.template.template_featurizer import InferenceTemplateFeaturizer
 from mol.data.template.template_utils import TemplateHitFeaturizer
 from mol.data.utils import data_type_transform, make_dummy_feature
+from mol.metrics.ipsae import protein_token_groups, validate_ipsae_interface
 from mol.utils.distributed import DIST_WRAPPER
 from mol.utils.torch_utils import collate_fn_identity, dict_to_tensor
 
@@ -140,6 +141,13 @@ class InferenceDataset(Dataset):
             single_sample_dict,
         )
         features_dict, atom_array, token_array = sample2feat.get_feature_dict()
+        ipsae_interface = single_sample_dict.get("ipsae_interface")
+        if ipsae_interface is not None:
+            # Reject invalid selections before MSA/template work or prediction.
+            groups = protein_token_groups(
+                atom_array, features_dict["atom_to_token_idx"], len(token_array)
+            )
+            ipsae_interface = validate_ipsae_interface(ipsae_interface, groups)
         features_dict["distogram_rep_atom_mask"] = torch.Tensor(
             atom_array.distogram_rep_atom_mask
         ).long()
@@ -188,6 +196,8 @@ class InferenceDataset(Dataset):
 
         data = {}
         data["input_feature_dict"] = feat
+        if ipsae_interface is not None:
+            data["ipsae_interface"] = ipsae_interface
         # Add dimension related items
         N_token = feat["token_index"].shape[0]
         N_atom = feat["atom_to_token_idx"].shape[0]

@@ -707,6 +707,7 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                     seed=seed,
                     pred_dict=prediction,
                     atom_array=atom_array,
+                    ipsae_interface=data.get("ipsae_interface"),
                     entity_poly_type={
                         k: v
                         for k, v in data["entity_poly_type"].items()

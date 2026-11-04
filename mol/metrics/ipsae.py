@@ -66,12 +66,66 @@ def _directional_scores(block: np.ndarray) -> tuple[float, float]:
     return tuple(scores)
 
 
-def ipsae_summary(pae, groups, *, pae_is_rounded: bool = False) -> dict:
+def validate_ipsae_interface(interface, protein_chains):
+    """Validate two disjoint, nonempty lists of protein chain labels.
+
+    Unlisted chains are allowed: callers may score one interface in a larger
+    assembly. Return owned lists so per-job metadata is safe to hand to a writer.
+    """
+    if interface is None:
+        return None
+    if not isinstance(interface, (list, tuple)) or len(interface) != 2:
+        raise ValueError("ipsae_interface must contain exactly two lists of chain IDs")
+    available = set(protein_chains)
+    seen = set()
+    sides = []
+    for side in interface:
+        if not isinstance(side, (list, tuple)) or not side:
+            raise ValueError("ipsae_interface sides must be nonempty lists of chain IDs")
+        for chain in side:
+            if not isinstance(chain, str) or not chain:
+                raise ValueError("ipsae_interface chain IDs must be nonempty strings")
+            if chain in seen:
+                raise ValueError("ipsae_interface chain IDs must be unique and disjoint")
+            if chain not in available:
+                raise ValueError(
+                    f"ipsae_interface chain {chain!r} has no protein CA tokens; "
+                    f"available protein chains: {sorted(available)}"
+                )
+            seen.add(chain)
+        sides.append(list(side))
+    return sides
+
+
+def _interface_scores(values, rows, cols):
+    forward = values[np.ix_(rows, cols)]
+    reverse = values[np.ix_(cols, rows)]
+    if any(
+        not np.isfinite(block).all() or (block < 0).any()
+        for block in (forward, reverse)
+    ):
+        raise ValueError("ipSAE requires finite, nonnegative interchain PAE")
+    a, a_ref = _directional_scores(forward)
+    b, b_ref = _directional_scores(reverse)
+    return {
+        "ipsae_1_to_2": a,
+        "ipsae_2_to_1": b,
+        "ipsae_min_10": min(a, b),
+        "ipsae_1_to_2_d0ref": a_ref,
+        "ipsae_2_to_1_d0ref": b_ref,
+        "ipsae_min_10_d0ref": min(a_ref, b_ref),
+    }
+
+
+def ipsae_summary(
+    pae, groups, *, pae_is_rounded: bool = False, interface=None
+) -> dict:
     """Score all protein chain pairs without writing or rereading a PAE file.
 
-    Two protein chains have an unambiguous top-level minimum. For zero/one or
-    more than two protein chains that scalar is None; multichain callers use
-    the explicitly labelled pair records. Existing ranking scores are unchanged.
+    ``interface`` selects two lists of protein chain labels. Pool each side's
+    CA tokens before counting partners and scoring; within-side pairs are
+    excluded. Without a selection, only exactly two protein chains have a
+    top-level scalar. All individual chain-pair records remain available.
     """
     if len(pae.shape) != 2 or pae.shape[0] != pae.shape[1]:
         raise ValueError("ipSAE requires a square PAE matrix")
@@ -88,6 +142,8 @@ def ipsae_summary(pae, groups, *, pae_is_rounded: bool = False) -> dict:
             raise ValueError("ipSAE chain token indices must be unique and disjoint")
         occupied.update(unique)
         normalized[str(chain)] = indices
+
+    interface = validate_ipsae_interface(interface, normalized)
 
     result = {
         "ipsae_min_10": None,
@@ -110,28 +166,27 @@ def ipsae_summary(pae, groups, *, pae_is_rounded: bool = False) -> dict:
         values = np.round(values, 2)
     for chain_1, chain_2 in combinations(normalized, 2):
         rows, cols = normalized[chain_1], normalized[chain_2]
-        forward = values[np.ix_(rows, cols)]
-        reverse = values[np.ix_(cols, rows)]
-        if any(
-            not np.isfinite(block).all() or (block < 0).any()
-            for block in (forward, reverse)
-        ):
-            raise ValueError("ipSAE requires finite, nonnegative interchain PAE")
-        a, a_ref = _directional_scores(forward)
-        b, b_ref = _directional_scores(reverse)
         result["ipsae_chain_pairs"].append(
             {
                 "chain_1": chain_1,
                 "chain_2": chain_2,
-                "ipsae_1_to_2": a,
-                "ipsae_2_to_1": b,
-                "ipsae_min_10": min(a, b),
-                "ipsae_1_to_2_d0ref": a_ref,
-                "ipsae_2_to_1_d0ref": b_ref,
-                "ipsae_min_10_d0ref": min(a_ref, b_ref),
+                **_interface_scores(values, rows, cols),
             }
         )
-    if len(normalized) == 2:
+    if interface is not None:
+        rows, cols = (
+            np.concatenate([normalized[chain] for chain in side])
+            for side in interface
+        )
+        selected = _interface_scores(values, rows, cols)
+        result["ipsae_interface"] = {
+            "chains_1": interface[0],
+            "chains_2": interface[1],
+            **selected,
+        }
+        result["ipsae_min_10"] = selected["ipsae_min_10"]
+        result["ipsae_min_10_d0ref"] = selected["ipsae_min_10_d0ref"]
+    elif len(normalized) == 2:
         pair = result["ipsae_chain_pairs"][0]
         result["ipsae_min_10"] = pair["ipsae_min_10"]
         result["ipsae_min_10_d0ref"] = pair["ipsae_min_10_d0ref"]

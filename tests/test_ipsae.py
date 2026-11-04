@@ -100,12 +100,88 @@ def test_modified_residues_ligands_and_chain_labels():
     assert got["ipsae_chain_pairs"][0]["chain_2"] == "Y"
 
 
-@pytest.mark.parametrize("n_chain", [0, 1, 3])
+@pytest.mark.parametrize("n_chain", [0, 1, 3, 4, 5, 6])
 def test_no_ambiguous_multichain_scalar(n_chain):
-    got = ipsae_summary(np.ones((3, 3)), {str(i): [i] for i in range(n_chain)})
+    got = ipsae_summary(np.ones((6, 6)), {str(i): [i] for i in range(n_chain)})
     assert got["ipsae_min_10"] is None
     assert got["ipsae_min_10_d0ref"] is None
     assert len(got["ipsae_chain_pairs"]) == n_chain * (n_chain - 1) // 2
+
+
+@pytest.mark.parametrize("n_chain", [3, 4, 6])
+def test_grouped_interface_matches_pooled_exported_pae(n_chain):
+    rng = np.random.default_rng(72)
+    groups = {f"chain_{i}": np.arange(i * 31, (i + 1) * 31) for i in range(n_chain)}
+    pae = rng.uniform(0, 16, size=(31 * n_chain, 31 * n_chain)).astype(np.float32)
+    pae[0, 31] = 9.9951
+    pae[31, 0] = 9.9949
+    pae[1, 31:] = 12  # An empty retained-partner row.
+    sides = [list(groups)[:n_chain // 2], list(groups)[n_chain // 2:]]
+    got = ipsae_summary(torch.from_numpy(pae), groups, interface=sides)
+    exported = np.asarray(json.loads(json.dumps(np.round(pae, 2).tolist())), np.float32)
+    assert got == ipsae_summary(exported, groups, interface=sides, pae_is_rounded=True)
+    rows, cols = [np.concatenate([groups[chain] for chain in side]) for side in sides]
+    record = got["ipsae_interface"]
+    assert record["chains_1"] == sides[0]
+    assert record["chains_2"] == sides[1]
+    for clip, suffix in ((27, ""), (26, "_d0ref")):
+        a = reference_direction(exported, rows, cols, clip)
+        b = reference_direction(exported, cols, rows, clip)
+        assert record["ipsae_1_to_2" + suffix] == pytest.approx(a, abs=1e-14, rel=0)
+        assert record["ipsae_2_to_1" + suffix] == pytest.approx(b, abs=1e-14, rel=0)
+        assert got["ipsae_min_10" + suffix] == pytest.approx(min(a, b), abs=1e-14, rel=0)
+    default = ipsae_summary(pae, groups)
+    assert got["ipsae_chain_pairs"] == default["ipsae_chain_pairs"]
+    swapped = ipsae_summary(pae, groups, interface=sides[::-1])
+    assert swapped["ipsae_min_10"] == got["ipsae_min_10"]
+    assert swapped["ipsae_interface"]["ipsae_1_to_2"] == record["ipsae_2_to_1"]
+
+
+def test_pooled_partner_count_is_not_maximum_chain_pair():
+    # Each pair has 20 partners per row; pooling two chains gives 40 and changes d0.
+    groups = {"A": np.arange(40), "B": np.arange(40, 60), "C": np.arange(60, 80)}
+    pae = np.full((80, 80), 2.0, dtype=np.float32)
+    got = ipsae_summary(pae, groups, interface=[["A"], ["B", "C"]])
+    for key in ("ipsae_min_10", "ipsae_min_10_d0ref"):
+        assert got[key] > max(pair[key] for pair in got["ipsae_chain_pairs"])
+
+
+def test_internal_interface_and_unselected_chains_cannot_inflate_selected_score():
+    groups = {"A": [0], "B": [1], "C": [2], "spectator": [3]}
+    pae = np.zeros((4, 4), dtype=np.float32)
+    pae[0, 1:3] = pae[1:3, 0] = 20
+    got = ipsae_summary(pae, groups, interface=[["A"], ["B", "C"]])
+    assert got["ipsae_min_10"] == got["ipsae_min_10_d0ref"] == 0
+    assert max(pair["ipsae_min_10"] for pair in got["ipsae_chain_pairs"]) == 1
+
+
+def test_explicit_two_chain_selection_preserves_legacy_scores():
+    pae = np.random.default_rng(8).uniform(0, 16, (68, 68)).astype(np.float32)
+    groups = {"A": np.arange(31), "B": np.arange(31, 68)}
+    old = ipsae_summary(pae, groups)
+    selected = ipsae_summary(pae, groups, interface=[["A"], ["B"]])
+    selected.pop("ipsae_interface")
+    assert old == selected
+
+
+@pytest.mark.parametrize("interface", [
+    [], [["A"]], [["A"], ["B"], ["C"]], "AB", {"A": [], "B": []},
+    ["A", "B"], [[], ["B"]], [["A"], []], [["A", "A"], ["B"]],
+    [["A"], ["A", "B"]], [["unknown"], ["B"]], [[1], ["B"]],
+    [[""], ["B"]], [[None], ["B"]], [[["A"]], ["B"]],
+])
+def test_rejects_invalid_interface_selection(interface):
+    with pytest.raises(ValueError, match="ipsae_interface"):
+        ipsae_summary(np.ones((3, 3)), {"A": [0], "B": [1], "C": [2]},
+                      interface=interface)
+
+
+@pytest.mark.parametrize("chain", ["L", "R"])
+def test_interface_rejects_nonprotein_chains(chain):
+    atoms, mapping = representative_atoms()
+    groups = protein_token_groups(atoms, mapping, 8)
+    with pytest.raises(ValueError, match="no protein CA tokens"):
+        ipsae_summary(np.ones((8, 8)), groups, interface=[["X"], [chain]])
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0])
@@ -122,10 +198,17 @@ def test_rejects_invalid_chain_indices(groups):
 
 @pytest.mark.parametrize("full_output", [False, True])
 @pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("multichain", [False, True])
 def test_native_dump_scores_without_full_json_and_keeps_rank_order(
-    tmp_path, full_output, background
+    tmp_path, full_output, background, multichain
 ):
     atoms, mapping = representative_atoms()
+    interface = None
+    groups = {"X": [0, 2], "Y": [4, 7]}
+    if multichain:
+        atoms.chain_id[-1] = "Z"
+        groups = {"X": [0, 2], "Y": [4], "Z": [7]}
+        interface = [["X"], ["Y", "Z"]]
     scores = []
     full_data = []
     for i in range(2):
@@ -151,7 +234,8 @@ def test_native_dump_scores_without_full_json_and_keeps_rank_order(
         with PredictionWriter(dumper, lambda *args: errors.append(args),
                               background=background) as writer:
             writer.submit(dataset_name="", pdb_id="test", seed=101,
-                          pred_dict=prediction, atom_array=atoms, entity_poly_type={})
+                          pred_dict=prediction, atom_array=atoms, entity_poly_type={},
+                          ipsae_interface=interface)
     assert not errors
     assert list(structures.call_args.kwargs["sorted_indices"]) == [1, 0]
     folder = tmp_path / "test/seed_101/predictions"
@@ -161,7 +245,7 @@ def test_native_dump_scores_without_full_json_and_keeps_rank_order(
         )
         expected = ipsae_summary(
             np.full((8, 8), 2.1234 + original, dtype=np.float32),
-            {"X": [0, 2], "Y": [4, 7]},
+            groups, interface=interface,
         )
         for key in expected:
             assert summary[key] == expected[key]

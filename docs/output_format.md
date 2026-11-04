@@ -53,6 +53,7 @@ scores. `n_chain` below is the number of chains in the job.
 | `ipsae_min_10` | scalar or `null` | Conservative protein interface score: minimum of the two directional ipSAE scores, PAE cutoff 10 Å, benchmark count clip 27. Present by default; no full-data JSON required. |
 | `ipsae_min_10_d0ref` | scalar or `null` | Same calculation with the Dunbrack reference count clip 26. |
 | `ipsae_chain_pairs` | list | Protein chain pairs with their actual CIF chain labels, both directional scores, and both minima. |
+| `ipsae_interface` | object, when requested | Selected `chains_1` and `chains_2` lists, both directional scores, and both minima, scored over pooled residues. |
 | `ipsae_parameters` | object | Cutoff, PAE rounding precision, and both count clips used for the calculation. |
 
 Two things that surprise people:
@@ -66,12 +67,26 @@ Two things that surprise people:
 ### Native ipSAE
 
 Every normal prediction writes ipSAE into its summary without another model
-pass or an external scoring script. For exactly two protein chains,
-`ipsae_min_10` is their score. For fewer or more than two protein chains it is
-`null`; `ipsae_chain_pairs` contains every available pair explicitly. A pair
+pass or an external scoring script. Without an explicit interface selection,
+`ipsae_min_10` is the score for exactly two protein chains. For fewer or more
+than two protein chains it is `null`; `ipsae_chain_pairs` contains every
+available pair explicitly. A pair
 with no PAE values below the cutoff scores zero. Nonprotein chains are excluded,
 and modified protein residues contribute only their CA token, once per residue.
 The existing `ranking_score` and output sample order do not change.
+
+For two or more protein chains, the input job can declare
+`"ipsae_interface": [["A"], ["B", "C"]]` to score A against the combined
+residues of B and C. Both top-level scalars then report that selected interface.
+The additional `ipsae_interface` output record contains `chains_1`, `chains_2`,
+`ipsae_1_to_2`, `ipsae_2_to_1`, `ipsae_min_10`, and the corresponding `_d0ref`
+fields. Individual chain-pair records remain unchanged. See
+[input validation and examples](infer_json_format.md#ipsae-interface-selection).
+
+For each direction, partner counts and row averages use the entire opposite
+side's pooled CA tokens. Within-side interfaces and unlisted chains are
+excluded from this score. Taking a maximum or average of separate chain-pair
+scores is not equivalent to this pooled calculation.
 
 The score matches postprocessing Mol-1's two-decimal full-data PAE, including
 rounding before the strict `PAE < 10` cutoff. For each direction, each residue's

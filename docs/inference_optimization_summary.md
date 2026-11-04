@@ -178,8 +178,10 @@ rounding to two decimals before `PAE < 10`. The `min` field uses the smaller
 directional score and count clip 27; `ipsae_min_10_d0ref` uses clip 26. This is
 not a promise of equality with scripts using different normalization or
 directional aggregation. Cache and CPU-overlap comparisons preserved the score
-exactly at fixed grouping. Fewer or more than two protein chains yield a null
-top-level value; pair records remain available.
+exactly at fixed grouping. Without an explicit interface selection, fewer or
+more than two protein chains yield a null top-level value. Jobs can now declare
+[`ipsae_interface`](infer_json_format.md#ipsae-interface-selection) to score two
+groups of protein chains; pair records remain available in either case.
 
 ## Configuration to use as a starting point
 

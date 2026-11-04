@@ -94,6 +94,7 @@ def infer_predict_context_parallel(runner, configs):
                     seed=seed,
                     pred_dict=prediction,
                     atom_array=atoms,
+                    ipsae_interface=data.get("ipsae_interface"),
                     entity_poly_type={
                         k: v
                         for k, v in data["entity_poly_type"].items()

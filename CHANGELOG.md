@@ -37,6 +37,14 @@ for the measured results and reproduction commands.
 
 ### Added
 
+- Per-job `ipsae_interface` selections, for example `[["A"], ["B", "C"]]`,
+  populate native ipSAE scalars for interfaces between two groups of protein
+  chains. Scoring pools CA tokens on each side before calculating partner
+  counts and excludes within-side interfaces. Summaries record the selected
+  labels and directional scores alongside all existing chain-pair records.
+  Invalid selections fail before inference. Supported by ordinary, batched
+  (including background output) and context-parallel prediction, without
+  full-data JSON. Existing behavior is preserved when no selection is supplied.
 - Request-local atom-block conditioning caches for input batching, available
   through `--infer_setting.atom_block_cache true`. Caching remains **off by
   default**. A subsequent uncontended H200 comparison on real 9fm7/8cnh measured

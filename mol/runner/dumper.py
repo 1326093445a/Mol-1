@@ -80,6 +80,7 @@ class DataDumper:
         pred_dict: dict,
         atom_array: AtomArray,
         entity_poly_type: dict[str, str],
+        ipsae_interface=None,
     ):
         """
         Dump the predictions and related data to the specified directory.
@@ -91,6 +92,7 @@ class DataDumper:
             pred_dict (dict): The dictionary containing the predictions.
             atom_array (AtomArray): The AtomArray object containing the structure data.
             entity_poly_type (dict[str, str]): The entity poly type information.
+            ipsae_interface: Optional two lists of protein chain IDs to score.
         """
         dump_dir = self._get_dump_dir(dataset_name, pdb_id, seed)
         Path(dump_dir).mkdir(parents=True, exist_ok=True)
@@ -102,6 +104,7 @@ class DataDumper:
             atom_array=atom_array,
             entity_poly_type=entity_poly_type,
             seed=seed,
+            ipsae_interface=ipsae_interface,
         )
 
     def _get_dump_dir(self, dataset_name: str, sample_name: str, seed: int) -> str:
@@ -122,6 +125,7 @@ class DataDumper:
         atom_array: AtomArray,
         entity_poly_type: dict[str, str],
         seed: int,
+        ipsae_interface=None,
     ):
         """
         Dump raw predictions from the model.
@@ -171,6 +175,7 @@ class DataDumper:
             seed=seed,
             sorted_indices=sorted_indices,
             atom_array=atom_array,
+            ipsae_interface=ipsae_interface,
         )
 
     def _save_structure(
@@ -251,6 +256,7 @@ class DataDumper:
         seed: int,
         sorted_indices: Optional[List[int]],
         atom_array: Optional[AtomArray] = None,
+        ipsae_interface=None,
     ):
         """
         Save confidence data to JSON files.
@@ -278,6 +284,7 @@ class DataDumper:
                 data["summary_confidence"][idx].update(ipsae_summary(
                     data["full_data"][idx]["token_pair_pae"], groups,
                     pae_is_rounded=self.need_atom_confidence,
+                    interface=ipsae_interface,
                 ))
         if sorted_indices is None:
             sorted_indices = range(N_sample)

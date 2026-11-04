@@ -110,7 +110,10 @@ to a separate `full_data` JSON written only with `--need_atom_confidence true`.
 Protein-interface `ipsae_min_10` and its reference-normalization variant are
 included in the summary by default, including with `--need_atom_confidence false`;
 no separate PAE scoring script is needed. See the output-format guide for the
-exact definition and multichain pair records.
+exact definition and multichain pair records. For complexes with more than two
+protein chains, declare the two interface sides in each job, for example
+`"ipsae_interface": [["A"], ["B", "C"]]`, to populate the scalar from their
+combined residues. See [interface selection](docs/infer_json_format.md#ipsae-interface-selection).
 
 **MSA and template**. For an input of your own, `mol pred` searches for what the JSON does not carry. Protein MSAs come from the public ColabFold MMseqs2 service, so
 `--use_msa`, on by default, needs network access. With `--use_template true`,

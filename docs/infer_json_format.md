@@ -25,8 +25,42 @@ Each dictionary contains the following keys:
 * `sequences`: A list of dictionaries that describe the entities (e.g., proteins, DNA, RNA, small molecules, and ions) involved in the inference.
 * `covalent_bonds`: An optional list of dictionaries that define covalent bonds between entities or between CCD components within one ligand entity.
 * `modelSeeds`: An optional list of integer seeds. It is used only with `--use_seeds_in_json true`, and then the first job's list applies to every job in the file.
+* `ipsae_interface`: Optional two lists of protein chain IDs defining the two sides of the interface to score, for example `[["A"], ["B", "C"]]`. See [interface selection](#ipsae-interface-selection).
 
 Details of `sequences` and `covalent_bonds` are provided below.
+
+## ipSAE interface selection
+
+For a complex with more than two protein chains, add `ipsae_interface` to the
+job alongside `name` and `sequences`:
+
+```json
+"ipsae_interface": [["A"], ["B", "C"]]
+```
+
+This scores chain A against the combined protein residues of B and C. Either
+side can contain any number of chains, for example
+`[["A", "B"], ["C", "D", "E", "F"]]`. Use the actual output chain labels;
+set each entity's optional `id` list to choose those labels explicitly.
+Copies created by `count` are separate chains and must be listed individually.
+
+Both sides must be nonempty and disjoint, with no repeated IDs. Unknown IDs
+and chains without protein CA tokens (including ligands, DNA and RNA) are
+rejected during feature preparation, before model inference. Other chains
+may be omitted to score a specific interface within a larger assembly.
+
+The selection populates `ipsae_min_10` and `ipsae_min_10_d0ref` in every
+summary, plus an `ipsae_interface` record containing the selected labels and
+directional scores. It pools residues before calculating partner counts and
+scores; it does not combine precomputed chain-pair scores. Internal interfaces
+within either side do not enter the selected score. All `ipsae_chain_pairs`
+remain available, and `ranking_score` and sample order are unchanged.
+
+Omitting the field (or setting it to `null`) retains the default: exactly two
+protein chains produce a scalar; other chain counts produce `null`. This works
+with ordinary, batched and context-parallel inference and does not require
+`--need_atom_confidence true`. See [native ipSAE](output_format.md#native-ipsae)
+for the score definition.
 
 ## sequences
 There are 5 kinds of supported sequences:
