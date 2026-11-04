@@ -240,6 +240,16 @@ def memory_options(command: Any) -> Any:
     """
     for path, option_type, help_text in (
         (
+            "infer_setting.prefetch_inputs",
+            click.IntRange(min=0),
+            "Inputs to prepare ahead in one CPU worker (batch_size > 1); default 0.",
+        ),
+        (
+            "infer_setting.background_write",
+            bool,
+            "Overlap CPU output writing with the next input batch (batch_size > 1; default false).",
+        ),
+        (
             "infer_setting.atom_block_cache",
             bool,
             "Cache fixed atom-block conditioning during input batching (default false).",
@@ -305,6 +315,8 @@ def memory_settings_from_options(options: Mapping[str, Any]) -> dict:
         if value is not None:
             settings[path] = parse_chunk_size(path, value)
     for path in (
+        "infer_setting.prefetch_inputs",
+        "infer_setting.background_write",
         "infer_setting.atom_block_cache",
         "infer_setting.dynamic_chunk_size",
         "diffusion_cache_mode",

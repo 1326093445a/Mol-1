@@ -60,8 +60,10 @@ inference_configs = {
         **base_model_configs["infer_setting"],
         "sample_diffusion_chunk_size": ValueMaybeNone(1),
         "confidence_sample_chunk_size": ValueMaybeNone(1),
-        # Opt-in until full-model throughput is measured without GPU contention.
+        # Opt-in: measured gains are modest and validated on a small real cohort.
         "atom_block_cache": False,
+        "prefetch_inputs": 0,  # Bounded CPU worker queue; 0 keeps serial preparation.
+        "background_write": False,  # One CPU-only output job at a time.
         # Zero disables either scheduling limit. These never alter N_sample.
         "batch_max_padding_ratio": 0.0,
         "batch_max_pair_tokens": 0,
@@ -74,7 +76,13 @@ def validate_input_batching(configs, *, batch_size=None):
     size = configs.get("batch_size", 1) if batch_size is None else batch_size
     if isinstance(size, bool) or not isinstance(size, int) or size < 1:
         raise ValueError("batch_size must be a positive integer")
+    settings = configs.get("infer_setting", {})
+    prefetch = settings.get("prefetch_inputs", 0)
+    if isinstance(prefetch, bool) or not isinstance(prefetch, int) or prefetch < 0:
+        raise ValueError("prefetch_inputs must be a non-negative integer")
     if size == 1:
+        if prefetch or settings.get("background_write", False):
+            raise ValueError("prefetch_inputs/background_write require batch_size > 1")
         return
     ratio = configs.infer_setting.get("batch_max_padding_ratio", 0.0)
     if not math.isfinite(ratio) or (ratio != 0 and ratio < 1):

@@ -13,6 +13,7 @@ from biotite.structure import AtomArray
 
 from mol.metrics.ipsae import ipsae_summary, protein_token_groups
 from mol.runner.dumper import DataDumper
+from mol.runner.inference_pipeline import PredictionWriter
 
 
 def reference_direction(pae, rows, cols, clip):
@@ -120,8 +121,9 @@ def test_rejects_invalid_chain_indices(groups):
 
 
 @pytest.mark.parametrize("full_output", [False, True])
+@pytest.mark.parametrize("background", [False, True])
 def test_native_dump_scores_without_full_json_and_keeps_rank_order(
-    tmp_path, full_output
+    tmp_path, full_output, background
 ):
     atoms, mapping = representative_atoms()
     scores = []
@@ -143,9 +145,14 @@ def test_native_dump_scores_without_full_json_and_keeps_rank_order(
         "full_data": full_data,
     }
     dumper = DataDumper(str(tmp_path), need_atom_confidence=full_output)
+    errors = []
     # Real summary serialization; structure writing is orthogonal to this test.
     with patch.object(dumper, "_save_structure") as structures:
-        dumper.dump("", "test", 101, prediction, atoms, {})
+        with PredictionWriter(dumper, lambda *args: errors.append(args),
+                              background=background) as writer:
+            writer.submit(dataset_name="", pdb_id="test", seed=101,
+                          pred_dict=prediction, atom_array=atoms, entity_poly_type={})
+    assert not errors
     assert list(structures.call_args.kwargs["sorted_indices"]) == [1, 0]
     folder = tmp_path / "test/seed_101/predictions"
     for original, rank in ((0, 1), (1, 0)):

@@ -50,6 +50,8 @@ class PredMemoryOptionsTest(unittest.TestCase):
             "--infer_setting.diffusion_conditioning_row_chunk_size", "none",
             "--infer_setting.dynamic_chunk_size", "true",
             "--infer_setting.atom_block_cache", "true",
+            "--infer_setting.prefetch_inputs", "2",
+            "--infer_setting.background_write", "true",
             "--diffusion_cache_mode", "shared",
         )
         self.assertEqual(result.exit_code, 0, result.output)
@@ -61,6 +63,8 @@ class PredMemoryOptionsTest(unittest.TestCase):
                 "infer_setting.diffusion_conditioning_row_chunk_size": None,
                 "infer_setting.dynamic_chunk_size": True,
                 "infer_setting.atom_block_cache": True,
+                "infer_setting.prefetch_inputs": 2,
+                "infer_setting.background_write": True,
                 "diffusion_cache_mode": "shared",
             },
         )

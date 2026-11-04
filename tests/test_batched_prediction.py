@@ -186,10 +186,23 @@ def test_feature_errors_fail_the_run_but_other_inputs_finish(tmp_path, monkeypat
     assert "bad features" in (tmp_path / "ERR/job1.txt").read_text()
 
 
-def test_writer_failure_does_not_repeat_forward(tmp_path, monkeypatch):
-    calls, writes = run_scheduler(tmp_path, monkeypatch, writer_failure="job1")
+@pytest.mark.parametrize("background", [False, True])
+def test_writer_failure_does_not_repeat_forward(tmp_path, monkeypatch, background):
+    calls, writes = run_scheduler(
+        tmp_path, monkeypatch, writer_failure="job1",
+        budget_settings={"background_write": background},
+    )
     assert [len(call) for call in calls] == [2, 1]
     assert [name for name, _, _ in writes] == ["job0", "job2"]
+
+
+def test_background_writer_drains_partial_batch_and_oom_retries(tmp_path, monkeypatch):
+    calls, writes = run_scheduler(
+        tmp_path, monkeypatch, oom=True,
+        budget_settings={"background_write": True},
+    )
+    assert [len(call) for call in calls] == [2, 1, 1, 1]
+    assert [name for name, _, _ in writes] == ["job0", "job1", "job2"]
 
 
 def test_wrong_output_count_is_a_failure_for_every_batch_member(tmp_path, monkeypatch):

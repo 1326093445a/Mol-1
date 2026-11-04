@@ -11,9 +11,9 @@ import torch
 
 from mol.config.inference import validate_input_batching
 from mol.data.inference.infer_dataloader import InferenceDataset
+from mol.runner.inference_pipeline import PredictionWriter, prepared_jobs
 from mol.utils.distributed import DIST_WRAPPER
 from mol.utils.logger import get_logger
-from mol.utils.seed import seed_everything
 
 logger = get_logger(__name__)
 
@@ -178,7 +178,7 @@ def infer_predict_batched(runner, configs):
                         n_token=int(data["N_token"].item()),
                         n_sample=configs.sample_diffusion.N_sample,
                     )
-                    runner.dumper.dump(
+                    writer.submit(
                         dataset_name="",
                         pdb_id=data["sample_name"],
                         seed=seed,
@@ -195,7 +195,7 @@ def infer_predict_batched(runner, configs):
                     report(data, seed, traceback.format_exc())
             del pred
             logger.info(
-                "[Rank %d] %d/%d inputs, %d samples/input, %.2fs including output",
+                "[Rank %d] %d/%d inputs, %d samples/input, %.2fs including output submission",
                 DIST_WRAPPER.rank,
                 completed,
                 len(items),
@@ -222,13 +222,27 @@ def infer_predict_batched(runner, configs):
     # all of a job's seeds. Sorting reduces wasted quadratic pair padding.
     indices = sorted(range(len(jobs)), key=estimated_size)
     owned = indices[DIST_WRAPPER.rank :: DIST_WRAPPER.world_size]
-    pending, bucket = [], None
-    for seed in dict.fromkeys(seed for seeds in schedules for seed in seeds):
-        for index in owned:
-            if seed not in schedules[index]:
-                continue
-            seed_everything(seed, deterministic=configs.deterministic)
-            data, atom_array, error = dataset[index]
+    tasks = (
+        (index, seed)
+        for seed in dict.fromkeys(seed for seeds in schedules for seed in seeds)
+        for index in owned
+        if seed in schedules[index]
+    )
+    with (
+        PredictionWriter(
+            runner.dumper,
+            report,
+            background=configs.infer_setting.get("background_write", False),
+        ) as writer,
+        prepared_jobs(
+            dataset,
+            tasks,
+            deterministic=configs.deterministic,
+            prefetch=configs.infer_setting.get("prefetch_inputs", 0),
+        ) as prepared,
+    ):
+        pending, bucket = [], None
+        for seed, data, atom_array, error in prepared:
             if error:
                 report(data, seed, error)
                 continue
@@ -246,8 +260,8 @@ def infer_predict_batched(runner, configs):
             if len(pending) == configs.batch_size:
                 predict(pending)
                 pending = []
-    if pending:
-        predict(pending)
+        if pending:
+            predict(pending)
     if failures:
         raise RuntimeError(
             f"{len(failures)} input/seed prediction(s) failed. First: {failures[0]}"

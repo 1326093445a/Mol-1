@@ -247,6 +247,23 @@ def test_batch_configuration_rejects_unsupported_modes():
         validate_input_batching(cfg, batch_size=0)
 
 
+@pytest.mark.parametrize("value", [-1, True, 1.5])
+def test_invalid_prefetch_depth_is_rejected(value):
+    cfg = tiny_config()
+    with cfg.ignore_type():
+        cfg.infer_setting.prefetch_inputs = value
+    with pytest.raises(ValueError, match="prefetch_inputs"):
+        validate_input_batching(cfg, batch_size=2)
+
+
+@pytest.mark.parametrize("key,value", [("prefetch_inputs", 2), ("background_write", True)])
+def test_pipeline_options_are_not_silently_ignored_for_legacy_singleton(key, value):
+    cfg = tiny_config()
+    cfg.infer_setting[key] = value
+    with pytest.raises(ValueError, match="require batch_size > 1"):
+        validate_input_batching(cfg, batch_size=1)
+
+
 def test_triangle_chunking_does_not_materialize_cubic_broadcast(monkeypatch):
     from mol.model.triangular import triangular
 
