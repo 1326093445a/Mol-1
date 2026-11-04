@@ -32,6 +32,17 @@ for the measured results and reproduction commands.
 
 - Request-local atom-block conditioning caches for input batching, available
   through `--infer_setting.atom_block_cache true`. Caching remains **off by
-  default**: tested predictions matched bitwise, but shared-GPU whole-model
-  timings showed no improvement. The component microbenchmark alone does not
-  establish a full-model speedup (`2ed8457`).
+  default**. A subsequent uncontended H200 comparison on real 9fm7/8cnh measured
+  63.36 s uncached versus 61.13 s cached (3.5% less model time), with bitwise
+  identical coordinates, confidence and native ipSAE. This small-cohort result
+  supersedes the earlier inconclusive shared-GPU timing (`2ed8457`).
+- Opt-in bounded CPU preparation and output writing for independent input
+  batches: `--infer_setting.prefetch_inputs 2` and
+  `--infer_setting.background_write true`. Preparation uses one spawned CPU
+  worker per rank and preserves each job's post-featurization RNG state.
+  Background writing owns CPU copies, drains on exit and propagates failures.
+  Both controls default off and require `--batch_size` greater than one.
+  Four real examples reproduced raw predictions and all CIF/summary files
+  exactly at fixed grouping. The short-queue measurement showed no gain;
+  later passes shared the GPU with another process. See the
+  [targeted measurements](docs/inference_batching.md#targeted-h200-pass-2026-11-04).

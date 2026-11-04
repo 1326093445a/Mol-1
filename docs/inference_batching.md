@@ -85,6 +85,28 @@ Two optional limits use **actual featurized token counts** to split batches:
 Both default to zero (disabled). A singleton always runs, even if it exceeds
 the pair budget. Neither limit changes an input's samples or seed ownership.
 
+### CPU preparation and output overlap
+
+For a queue with `--batch_size` greater than one, these controls are independent:
+
+- `--infer_setting.prefetch_inputs 2` prepares up to two future inputs in one
+  spawned CPU worker per GPU rank. Zero, the default, retains serial preparation.
+- `--infer_setting.background_write true` sends output writing, including native
+  ipSAE, to one CPU thread. Its default is false.
+
+The preparation worker has no GPU access. Each job is seeded separately, and
+the main process restores the serial featurizer's resulting CPU RNG state.
+Prepared jobs retain their original order and rank ownership. The writer copies
+only the coordinates and confidence data it needs to CPU, owns its atom array,
+and holds at most one pending output job. All writes finish before the command
+returns; output failures still produce a nonzero exit. Forward OOM retries keep
+their existing behavior.
+
+These controls do not change samples, cycles, precision, or prediction math.
+They add worker startup and CPU memory costs, so measure complete queue time
+before enabling them for a workload. They are rejected for the legacy
+`--batch_size 1` path rather than silently ignored.
+
 ## Seeds and multiple GPUs
 
 With `--use_seeds_in_json true`, each job's `modelSeeds` is respected. Otherwise
@@ -441,9 +463,9 @@ implementations. Shared-GPU full-model timings were:
 | Ordinary | 95.63 | 96.99 |
 | Deterministic | 100.38 | 102.33 |
 
-These measurements showed no full-model gain. Caching therefore remains opt-in
-pending a measurement without competing GPU work; the component improvement
-alone is insufficient to enable it by default.
+Those shared-GPU measurements showed no full-model gain. A subsequent isolated
+comparison is recorded below; caching remains opt-in because the measured gain
+has only been validated on a small cohort.
 
 The instrumented real-input trunk pass identified triangle attention as the
 largest measured substage: 20.65 s, versus 13.50 s for triangle multiplication,
@@ -451,4 +473,152 @@ largest measured substage: 20.65 s, versus 13.50 s for triangle multiplication,
 instrumented trunk time was 51.47 s. These shared-GPU measurements are for
 prioritization, not an isolated performance claim. MSA/template computation
 semantics, confidence precision, five samples and ten recycles are preserved.
-Input prefetch and background output writing remain future work.
+The optional CPU pipeline described above now implements input prefetch and
+background output writing.
+
+## Targeted H200 pass (2026-11-04)
+
+All model comparisons use the `mol1` environment, cached `mol-1-base.pt`, five
+samples, ten recycles, 200 diffusion steps, sample/confidence chunks of five,
+TMK3 multiplication, cuEquivariance attention, BF16 trunk and the existing FP32
+diffusion/confidence policy. MSA, templates and TF32 are off. GPU 7 is monitored
+every two seconds for competing compute processes. Raw reports and predictions
+are under `output/mol1_targeted_pass/`.
+
+### Atom cache
+
+The real 9fm7 (644 tokens) plus 8cnh (509 tokens) comparison used an uncached and
+cached warmup followed by uncached/cached/cached/uncached timed passes:
+
+| Variant | Timed passes (s) | Median (s) |
+| --- | --- | ---: |
+| Uncached | 63.372, 63.342 | 63.357 |
+| Cached | 61.112, 61.147 | 61.130 |
+
+Caching reduced model time by **3.52%**. Peak allocated memory was 44.46 GiB for
+both. Coordinates, PAE, atom pLDDT, native ipSAE and rankings matched bitwise,
+including repeats. No competing GPU process was observed. This supports using
+the opt-in cache for similar workloads; it does not establish a universal gain.
+The report is `output/mol1_targeted_pass/cache/predictions/report.json`.
+
+### Triangle attention layout
+
+The installed Hopper cuEquivariance forward already makes Q/K/V contiguous
+inside its public operation. Moving those copies to the caller cannot remove
+them. A cost-inclusive microbenchmark used the model's actual Q/K/V strides,
+four heads of width 32, BF16, shared pair biases and six alternating-order
+measurement rounds. At B=2, N=644, median times were:
+
+| Variant | Milliseconds per attention call |
+| --- | ---: |
+| Existing layout | 4.226 |
+| Explicit contiguous Q/K/V | 4.225 |
+| 64-row chunks | 5.009 |
+| 128-row chunks | 4.784 |
+| 256-row chunks | 4.654 |
+| Separate call per input | 4.363 |
+
+The 245- and 509-token checks showed the same pattern. All checked outputs were
+bitwise identical and no GPU contention was observed. These are synthetic
+kernel timings, not whole-model speedups. No triangle-attention source change
+is warranted by these measurements. Reproduce with
+`python scripts/benchmark_triangle_layout.py --output output/triangle_layout.json`.
+
+### Mixed-length queue screening
+
+The queue uses complete repository examples, including their ligands: 7r6r
+(245 tokens), 8cnh (509), 9fm7 (644), and 8j2w (1,000). Atom caching is off for
+every queue variant. These timings exclude featurization and output writing:
+
+| Independent input grouping | First timed screen (s) | Peak allocated GiB |
+| --- | ---: | ---: |
+| One input per batched forward | 134.010 | 102.43 |
+| B=2, no padding cap | 166.981 | 104.05 |
+| B=4, no padding cap | 237.882 | 105.05 |
+| B=4, padding ratio cap 1.4 | 143.343 | 102.43 |
+
+The cap forms `[245]`, `[509, 644]`, `[1000]` groups instead of padding all four
+inputs to 1,000 tokens. B=4 and the capped configuration are single screening
+passes, not repeated throughput estimates. The best configuration and B=2 are
+also repeated in reverse order after screening. All forwards retain five
+samples and ten cycles. This cohort demonstrates padding cost; it is not a
+representative distribution of production inputs.
+
+The confirmation passes were 134.031 s for singleton groups and 166.990 s for
+B=2. Their two-pass medians are 134.021 s and 166.985 s: singleton groups use
+**19.74% less model time** on this queue. Peak allocation remains around
+102–105 GiB because the largest example's five-sample prediction dominates
+memory even when other inputs are processed separately.
+
+"One input" here means `predict_batch([input])`, retaining the independent
+per-input RNG path. It is not the legacy `mol pred --batch_size 1` path. For
+this distinct-length queue, `--batch_size 2` with
+`--infer_setting.batch_max_padding_ratio 1.0` produces equivalent singleton
+groups through the batched scheduler. Equal-length jobs can still share a batch.
+
+**Changing grouping does not preserve scores.** At seed 107, 9fm7's five native
+ipSAE values were approximately 0.0252–0.0266 when its forward's maximum length
+was 644, versus all zero when padded to 1,000 beside 8j2w. Some sample rankings
+also changed. Both B=2 and B=4 at maximum length 1,000 reproduced the same 9fm7
+scores. This pass does not establish the cause or harmlessness of that
+sensitivity. Keep grouping fixed when comparing implementation numerics;
+the exact cache/pipeline comparisons must not be generalized to batch-size
+changes. Raw per-sample scores are retained in the queue report.
+
+Reproduce the queue screen and serial-versus-pipeline validation using the
+baseline scheduler from before the CPU pipeline change:
+
+```bash
+git show 5f54253:mol/runner/batched_prediction.py > /tmp/mol1_serial_scheduler.py
+conda activate mol1
+MOL_ROOT_DIR=/storage/frank/mol1_root LAYERNORM_TYPE=torch \
+  CUDA_VISIBLE_DEVICES=7 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+  python scripts/benchmark_inference_queue.py \
+  --checkpoint /storage/frank/mol1_root/checkpoint/mol-1-base.pt \
+  --baseline-scheduler /tmp/mol1_serial_scheduler.py \
+  --output output/targeted_queue
+```
+
+Model weights load once. The pipeline comparison includes fresh worker startup,
+featurization, raw prediction hashing and all completed CIF/JSON writes. The
+parent's CCD caches are warm from preparation; each spawned worker starts with
+cold process-local caches. It is a loaded-model queue comparison, not a complete
+cold CLI startup measurement. `--phase batching` and `--phase pipeline` run
+either portion separately.
+
+### CPU pipeline validation
+
+With fixed B=2 / padding cap 1.4 groups, the original scheduler and the new
+`prefetch_inputs=2`, `background_write=true` path produced **bitwise identical
+raw coordinates, PAE and atom pLDDT** for all four examples. Each pass wrote
+40 files: five CIFs and five native confidence summaries per input. All 40
+relative file paths and bytes matched across both implementations and repeats,
+including native ipSAE and sample ordering. The spawned CPU featurizer's input
+features and atom arrays also matched serial preparation exactly.
+
+| Implementation | Complete queue passes (s) | Median (s) |
+| --- | --- | ---: |
+| Original serial scheduler | 147.722, 147.763 | 147.743 |
+| Prefetch + background writer | 159.746, 159.680 | 159.713 |
+
+**These pipeline timings are shared-GPU observations.** An unrelated pytest
+process first appeared on GPU 7 at 06:24:57 UTC, near the end of the first serial
+pass, and remained during the subsequent pipeline passes. The cache comparison,
+triangle microbenchmark and completed batch-size sweep preceded that process
+and had no observed GPU contention. No monitoring queries failed.
+
+The pipeline showed no throughput improvement in this short, warm-parent queue.
+Worker startup and cold worker CCD caches add costs that need amortizing across
+more inputs. Neither option is enabled by default; these measurements do not
+support claiming a pipeline speedup or a universal slowdown. A long production
+queue still needs its own measurement.
+
+The final CPU suite has **296 passed, 64 skipped, 27 subtests passed**, with the
+same three pre-existing pandas failures in `test_dataset_vectorization.py`.
+New coverage checks seed/RNG parity across spawned workers, bounded queues and
+cancellation, owned CPU output buffers, error propagation, OOM retry ownership,
+and native ipSAE with optional full-confidence JSON. The raw queue report is
+`output/mol1_targeted_pass/queue/predictions/report.json`; monitor logs, test
+logs and before/after prediction files are retained alongside it.
+CUDA pipeline/native ipSAE checks passed all 25 tests. A consolidated result
+with source hashes is saved in `output/mol1_targeted_pass/summary.json`.
