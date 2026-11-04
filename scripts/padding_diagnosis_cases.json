@@ -1,0 +1,12 @@
+{
+  "cases": [
+    {"label": "single", "chunk": 1024},
+    {"label": "chunk225", "chunk": 225},
+    {"label": "padded1000", "chunk": 225, "pad_trunk": 1000, "pad_diffusion": 1000},
+    {"label": "diffusion_pad_only", "chunk": 225, "pad_diffusion": 1000},
+    {"label": "trunk_pad_only", "chunk": 225, "pad_trunk": 1000},
+    {"label": "fp32_trunk_single", "chunk": 225, "trunk_dtype": "fp32", "trimul": "torch"},
+    {"label": "fp32_trunk_padded", "chunk": 225, "trunk_dtype": "fp32", "trimul": "torch", "pad_trunk": 1000}
+  ],
+  "finish": true
+}

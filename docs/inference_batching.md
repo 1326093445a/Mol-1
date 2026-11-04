@@ -560,8 +560,9 @@ groups through the batched scheduler. Equal-length jobs can still share a batch.
 ipSAE values were approximately 0.0252–0.0266 when its forward's maximum length
 was 644, versus all zero when padded to 1,000 beside 8j2w. Some sample rankings
 also changed. Both B=2 and B=4 at maximum length 1,000 reproduced the same 9fm7
-scores. This pass does not establish the cause or harmlessness of that
-sensitivity. Keep grouping fixed when comparing implementation numerics;
+scores. That timing pass did not establish the cause or harmlessness of the
+sensitivity; the subsequent diagnosis below isolates it. Keep grouping fixed
+when comparing implementation numerics;
 the exact cache/pipeline comparisons must not be generalized to batch-size
 changes. Raw per-sample scores are retained in the queue report.
 
@@ -622,3 +623,85 @@ and native ipSAE with optional full-confidence JSON. The raw queue report is
 logs and before/after prediction files are retained alongside it.
 CUDA pipeline/native ipSAE checks passed all 25 tests. A consolidated result
 with source hashes is saved in `output/mol1_targeted_pass/summary.json`.
+
+## Padding sensitivity diagnosis (2026-11-04)
+
+The real repository 9fm7 example was replayed at seed 107 with all chains and
+ligands, five samples, ten recycles and 200 diffusion steps. MSA, templates and
+TF32 stayed off. Diagnostic wrappers independently forced token padding from
+644 to 1,000 in the trunk and diffusion, without adding another protein. This
+separates padding from changes in chunk size, random streams or batch partners.
+
+| Controlled change | 9fm7 native ipSAE | Coordinate comparison to the BF16 unpadded reference |
+| --- | --- | --- |
+| Chunk size 1024 → 225 only | Exact, 0.02525–0.02665 | Bitwise exact |
+| Diffusion padding only | Exact | Max component change 0.00450 Å; RMSE 0.0000985 Å |
+| Trunk padding only | Zero for all five samples | RMSE 23.814 Å |
+| Trunk and diffusion padding | Zero for all five samples | RMSE 23.814 Å; max component change 86.421 Å |
+
+The last difference persists after rigid alignment: all-atom RMSD is
+28.6–33.7 Å across the five samples. It must not be described as a negligible
+change to the final prediction.
+
+### Where the difference starts
+
+Valid input embeddings and the first outgoing triangle multiplication match
+exactly. The first incoming triangle multiplication changes **15 of
+185,802,752 valid BF16 pair values** when the padded size changes. The maximum
+difference is 0.0078125; RMSE is 6.90e-7. After the first pair transition,
+58 values differ and RMSE is 2.09e-6. Subsequent blocks and recycling amplify
+this: pair-representation RMSE is 0.339 after the first cycle and 6.167 after
+the tenth. The initial diffusion noise remains bitwise identical.
+
+The evidence supports shape-dependent floating-point accumulation/rounding
+inside the trunk. A separate FP32-trunk control reduced padded-versus-unpadded
+final pair RMSE to 0.00384 and coordinate RMSE to 0.378 Å, but did not eliminate
+the difference (maximum coordinate-component change 7.50 Å). Both FP32 runs
+gave zero ipSAE; switching precision does not recover the original BF16 result.
+No inference precision or kernel defaults were changed.
+
+### Mask and scoring checks
+
+- Replacing **all artificial padding** with random values, while retaining the
+  masks and tensor shapes, left every recorded trunk/diffusion stage, final
+  coordinate, PAE and confidence summary bitwise identical to zero padding.
+- Repeating the full padded prediction with stock cuEquivariance triangle
+  multiplication matched TMK3 bitwise at every recorded stage and output.
+- A separate process repeated the padded TMK3 coordinates and PAE bitwise.
+- Native ipSAE correctly follows the changed PAE. The unpadded runs have
+  72–86 interchain pairs below 10 Å per direction/sample. The padded runs have
+  none: their minimum interchain PAE is 11.57–13.01 Å. The strict cutoff therefore
+  produces zero. No ipSAE or masking failure was reproduced in these checks.
+
+For this 644/1,000-token queue, `--batch_size 2` combined with
+`--infer_setting.batch_max_padding_ratio 1.0` prevents unequal-length inputs
+from sharing a padded forward, while retaining five samples and ten cycles.
+This retains the batched RNG path; the legacy `--batch_size 1` path uses a
+different RNG stream. For strict numerical comparisons, hold the actual
+grouping, tensor shapes, kernels and precision fixed. A padding cap alone is
+not a universal bitwise-equivalence guarantee across different configurations.
+
+Artifacts are in `output/mol1_padding_diagnosis/`: per-stage comparisons,
+full-precision predictions, native CIF/JSON outputs and mask/backend controls.
+The diagnosis is instrumented and some runs shared the GPU; it makes no
+performance claim. Reproduce with the included JSON plans:
+
+```bash
+conda activate mol1
+MOL_ROOT_DIR=/storage/frank/mol1_root LAYERNORM_TYPE=torch \
+  CUDA_VISIBLE_DEVICES=7 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+  python scripts/diagnose_padding_9fm7.py \
+  --checkpoint /storage/frank/mol1_root/checkpoint/mol-1-base.pt \
+  --plan scripts/padding_diagnosis_cases.json \
+  --output output/padding_recheck
+```
+
+`scripts/padding_mask_cases.json` runs the whole-model random-padding and
+cuEquivariance controls in a separate output directory.
+`scripts/probe_padding_trimul.py` probes the saved `first_trunk_input.pt` with
+the actual checkpoint's first-block weights. Both tools use local assets.
+
+The CPU suite retained 296 passes and its three pre-existing pandas failures
+(65 skipped, 27 subtests passed). Focused CUDA kernel/batching/ipSAE checks
+passed 51 tests and 86 subtests, including the new masked-padding regression.
+The consolidated diagnostic report is `output/mol1_padding_diagnosis/summary.json`.

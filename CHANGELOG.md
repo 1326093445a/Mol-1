@@ -4,6 +4,13 @@
 
 ### Prediction compatibility
 
+- **BF16 predictions depend on padding shape.** Real 9fm7 diagnostics isolated
+  small numerical changes in incoming triangle multiplication that amplify
+  through ten recycles. Padding from 644 to 1,000 tokens changed native ipSAE
+  from approximately 0.026 to zero. Randomized masked padding and stock
+  cuEquivariance controls matched the padded output bitwise. Keep grouping and
+  precision fixed for numerical comparisons; no inference defaults were changed.
+  See the [padding diagnosis](docs/inference_batching.md#padding-sensitivity-diagnosis-2026-11-04).
 - **Default CUDA inference behavior changes.** Atom-to-token sum/mean aggregation
   now uses a fixed atom order for ordinary no-gradient CUDA inference with a
   shared 1D atom map. This removes the unordered atomic additions that caused

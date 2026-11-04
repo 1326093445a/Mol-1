@@ -1,0 +1,8 @@
+{
+  "cases": [
+    {"label": "zero_pad", "chunk": 225, "pad_trunk": 1000, "pad_diffusion": 1000},
+    {"label": "poison_pad", "chunk": 225, "pad_trunk": 1000, "pad_diffusion": 1000, "poison_padding": true},
+    {"label": "cueq_pad", "chunk": 225, "pad_trunk": 1000, "pad_diffusion": 1000, "trimul": "cuequivariance"}
+  ],
+  "finish": true
+}

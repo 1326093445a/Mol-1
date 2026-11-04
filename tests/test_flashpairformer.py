@@ -136,6 +136,22 @@ def _opt_core_available() -> bool:
     "needs CUDA, TEST_FLASHPAIRFORMER_CUDA=1, and opt_core installed or OPT_CORE_DIR set",
 )
 class TestFlashPairformerCUDA(unittest.TestCase):
+    def test_masked_padding_contents_do_not_change_valid_outputs(self):
+        torch.manual_seed(919)
+        n, padded_n = 129, 197
+        for incoming in (False, True):
+            m = make_module(64, incoming=incoming, device="cuda")
+            z = torch.randn(padded_n, padded_n, 64, device="cuda", dtype=torch.bfloat16)
+            mask = torch.zeros(padded_n, padded_n, device="cuda", dtype=z.dtype)
+            mask[:n, :n] = 1
+            zero_padded = z * mask[..., None]
+            for backend in ("flashpairformer", "cuequivariance", "torch"):
+                with self.subTest(incoming=incoming, backend=backend):
+                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                        a = m(z, mask=mask, triangle_multiplicative=backend)
+                        b = m(zero_padded, mask=mask, triangle_multiplicative=backend)
+                    self.assertTrue(torch.equal(a[:n, :n], b[:n, :n]))
+
     def test_cueq_equivalence_mask_layout_dtype_residual(self):
         torch.manual_seed(731)
         for c in (64, 128, 256, 320, 448):
