@@ -273,6 +273,7 @@ mark comprising 172 interface clusters from 150 PDB entries.** (a)–(c) Success
 - [Kernel options](docs/kernels.md)
 - [Inference memory controls](docs/inference_memory.md)
 - [Independent inputs in one batch](docs/inference_batching.md)
+- [Inference optimization summary and measured speed](docs/inference_optimization_summary.md)
 - [Reference data](docs/data_sources.md)
 - [MSA and template pipeline](docs/msa_template_pipeline.md)
 

@@ -1,5 +1,10 @@
 # Independent complexes in one batch
 
+For the consolidated implementation status, current real-example timings and
+padding diagnosis, start with the
+[final inference optimization report](inference_optimization_summary.md).
+The measurements below retain the history and reproduction details.
+
 `mol pred --batch_size B --use_msa false` predicts up to B independent
 complexes together on each GPU. Their token counts, atom counts and chain
 counts may differ. Put the complexes in the **same JSON job list**, with a
