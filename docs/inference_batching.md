@@ -269,12 +269,21 @@ maximum component difference 0.422 angstrom and maximum CA-aligned RMSD 0.00515
 angstrom; rankings matched. Its ipSAE is null because it has one protein chain.
 Before/after CIFs, summary JSONs and full-precision comparison tensors are saved.
 
+The 0.422 angstrom number is a maximum Cartesian component difference; the
+largest per-atom displacement computed from those saved tensors is 0.456
+angstrom. The small overall RMSE therefore does not establish negligible
+changes at every atom or unchanged prediction accuracy. Exact agreement here
+means 9fm7 ipSAE and sample ordering, not every confidence value: in the batched
+8cnh example, ipTM changed by up to 0.0000141 and `ranking_score` by up to
+0.0000115 while the ordering stayed the same.
+
 The ordinary-mode timing run is unsuitable for claiming numerical equivalence:
 repeating the unchanged baseline already changed 9fm7 ipSAE by up to 0.02581 and
 changed sample rankings. The optimized implementation also varied across
-repeats. The cause of that existing nondeterminism was not isolated in this
-change. Exact ipSAE agreement above is limited to the controlled real-example
-test, not a guarantee for arbitrary predictions or ordinary-mode repeated runs.
+repeats. The cause was subsequently isolated and fixed in
+[stable atom aggregation](#stable-atom-aggregation-during-cuda-inference) below;
+these timings and comparisons describe the earlier attention-only revision.
+Exact ipSAE agreement above is limited to the controlled real-example test.
 
 Reproduce the comparison using a saved baseline helper from revision `8c3c5e5`:
 
@@ -318,6 +327,15 @@ MOL_RUN_BATCH_KERNEL_TESTS=1 TEST_FLASHPAIRFORMER_CUDA=1 LAYERNORM_TYPE=torch \
 
 ## Stable atom aggregation during CUDA inference
 
+**Default behavior change:** revision `dc12f1c` changes ordinary CUDA inference
+results relative to historical runs. The same checkpoint, input and seed can
+produce different coordinates, confidence values, ipSAE and sample rankings
+across this revision. Historical ordinary-mode results were not themselves
+repeatable in the measured cases. Record the code revision, environment,
+kernels, precision, batching and sampling settings when comparing predictions;
+re-run both sides under the same configuration when possible. This change is
+also recorded in the [unreleased changelog](../CHANGELOG.md#unreleased).
+
 The ordinary-mode variability reported above was traced to atom-to-token
 averaging. On real 9fm7 features the input atom embeddings were bitwise identical
 across calls, but CUDA `scatter_add_` changed the resulting BF16 averages by up
@@ -339,7 +357,9 @@ saved tensors also matched the earlier deterministic 4D-attention references
 exactly (8cnh has no protein-protein ipSAE). The unchanged ordinary
 baseline still varied across repeats. This fix can therefore change historical
 ordinary-mode predictions; it does not promise to reproduce a particular
-nondeterministic run or establish prediction accuracy.
+nondeterministic run or establish prediction accuracy. Bitwise agreement with
+the deterministic references was measured on these inputs and this environment,
+not established for every input, hardware platform or software version.
 
 Reproduce this comparison by substituting the aggregation helper:
 

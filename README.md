@@ -68,6 +68,12 @@ The example needs about 14 GB of GPU memory; on a 95 GiB NVIDIA Blackwell GPU it
 
 
 ## Predict with Mol-1
+
+**Comparing with existing predictions?** The default CUDA atom-aggregation fix
+and FP32 attention layout can change outputs even with the same checkpoint and
+seed. See the [unreleased compatibility notes](CHANGELOG.md#unreleased) before
+comparing historical structures or confidence scores.
+
 The easiest way to run Mol-1 prediction is:
 
 ```bash
