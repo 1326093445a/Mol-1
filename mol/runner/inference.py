@@ -24,7 +24,9 @@ import os
 import time
 import traceback
 import urllib.request
-from contextlib import nullcontext
+import weakref
+from contextlib import contextmanager, nullcontext
+from functools import wraps
 from os.path import exists as opexists, join as opjoin
 from typing import Any, Mapping
 
@@ -39,11 +41,13 @@ from mol.config.inference import (
     inference_configs,
     validate_context_parallel,
     validate_input_batching,
+    validate_inference_acceleration,
 )
 from mol.config.model_type import model_configs
 from mol.config.parser import parse_configs, parse_sys_args
 from mol.data.inference.infer_dataloader import get_inference_dataloader
 from mol.model.mol import Mol
+from mol.model.triangular.layers import skip_trunc_normal_init
 from mol.utils.distributed import DIST_WRAPPER
 from mol.utils.seed import seed_everything
 from mol.utils.torch_utils import to_device
@@ -52,6 +56,17 @@ from mol.data.sources import checkpoint_url, missing_reference_data
 from mol.runner.dumper import DataDumper
 
 logger = logging.getLogger(__name__)
+
+
+def _with_diffusion_acceleration(predict):
+    """Own acceleration through input transfers as well as model execution."""
+    @wraps(predict)
+    def wrapped(self, *args, **kwargs):
+        self._require_checkpoint_loaded()
+        with self._accelerated_prediction():
+            return predict(self, *args, **kwargs)
+
+    return wrapped
 
 
 class InferenceRunner(object):
@@ -64,6 +79,7 @@ class InferenceRunner(object):
     """
 
     def __init__(self, configs: Any) -> None:
+        validate_inference_acceleration(configs)
         validate_input_batching(configs)
         validate_context_parallel(configs)
         if configs.get("context_parallel_size", 1) > 1:
@@ -91,6 +107,14 @@ class InferenceRunner(object):
         requested = getattr(self.configs, "device", "auto")
         self.device = select_inference_device(requested, DIST_WRAPPER.local_rank)
         self.use_cuda = self.device.type == "cuda"
+        limit = self.configs.get("infer_setting", {}).get("cpu_thread_limit", 4)
+        if self.use_cuda and limit:
+            torch.set_num_threads(min(torch.get_num_threads(), limit))
+            if torch.get_num_interop_threads() > limit:
+                try:
+                    torch.set_num_interop_threads(limit)
+                except RuntimeError:
+                    logger.info("Inter-op thread pool is already initialized; retaining its current size.")
         if self.use_cuda:
             os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
             all_gpu_ids = ",".join(str(x) for x in range(torch.cuda.device_count()))
@@ -100,6 +124,10 @@ class InferenceRunner(object):
             )
             torch.cuda.set_device(self.device)
         logging.info(f"Inference device: {self.device} (requested {requested!r})")
+        logging.info(
+            "PyTorch CPU threads: intra-op=%d, inter-op=%d",
+            torch.get_num_threads(), torch.get_num_interop_threads(),
+        )
 
         if DIST_WRAPPER.world_size > 1 and not dist.is_initialized():
             from datetime import timedelta
@@ -134,7 +162,21 @@ class InferenceRunner(object):
         """
         Initialize the Mol-1 model and move it to the appropriate device.
         """
-        self.model = Mol(self.configs).to(self.device)
+        self.checkpoint_load_report = None
+        self.close()
+        fast_init = self.configs.get("infer_setting", {}).get("fast_init", False)
+        if fast_init and not self.configs.load_strict:
+            raise ValueError("infer_setting.fast_init requires load_strict=true")
+        self._skipped_trunc_normal_init = fast_init
+        self.print(f"Building model, fast_init={fast_init}")
+        started = time.perf_counter()
+        with skip_trunc_normal_init() if fast_init else nullcontext():
+            self.model = Mol(self.configs).to(self.device)
+        self.model_init_seconds = time.perf_counter() - started
+        self.print(
+            "Model construction and device transfer: "
+            f"{self.model_init_seconds:.2f}s"
+        )
 
     def load_checkpoint(self) -> None:
         """
@@ -143,6 +185,18 @@ class InferenceRunner(object):
         Raises:
             FileNotFoundError: If an explicitly requested path does not exist.
         """
+        # A failed reload can leave partially copied tensors. Invalidate readiness
+        # before any operation that can fail, including file/config validation.
+        self.checkpoint_load_report = None
+        self.close()
+        # Recheck at load time too: direct runner users can update configs
+        # between construction and loading.
+        if (
+            getattr(self, "_skipped_trunc_normal_init", False)
+            and not self.configs.load_strict
+        ):
+            raise ValueError("infer_setting.fast_init requires load_strict=true")
+        started = time.perf_counter()
         # Same resolution as download_inference_cache, which normally ran
         # first: an explicit path wins, otherwise the default location, and the
         # released weights are fetched only if nothing is there.
@@ -155,18 +209,73 @@ class InferenceRunner(object):
             checkpoint_path, map_location=self.device, weights_only=False
         )
 
-        sample_key = list(checkpoint["model"].keys())[0]
+        if (
+            not isinstance(checkpoint, Mapping)
+            or not isinstance(checkpoint.get("model"), Mapping)
+            or not checkpoint["model"]
+        ):
+            raise ValueError("Checkpoint must contain a nonempty 'model' state dictionary")
+        state = checkpoint["model"]
+        if any(not isinstance(key, str) for key in state):
+            raise ValueError("Checkpoint model keys must be strings")
+        if any(not isinstance(value, torch.Tensor) for value in state.values()):
+            raise ValueError("Checkpoint model values must be tensors")
+        sample_key = next(iter(state))
         self.print(f"Sampled key: {sample_key}")
-        if sample_key.startswith("module."):  # DDP checkpoint has module. prefix
-            checkpoint["model"] = {
-                k[len("module.") :]: v for k, v in checkpoint["model"].items()
-            }
-        self.model.load_state_dict(
-            state_dict=checkpoint["model"],
+        prefixed = [key.startswith("module.") for key in state]
+        if any(prefixed):
+            if not all(prefixed):
+                raise ValueError("Checkpoint mixes prefixed and unprefixed model keys")
+            state = {key[len("module."):]: value for key, value in state.items()}
+
+        # Check coverage and shapes before copying any weights. load_state_dict
+        # also checks these, but normally reports errors after copying other keys.
+        expected = self.model.state_dict()
+        missing = sorted(expected.keys() - state.keys())
+        unexpected = sorted(state.keys() - expected.keys())
+        mismatched = [
+            f"{key}: checkpoint {tuple(state[key].shape)}, model {tuple(value.shape)}"
+            for key, value in expected.items()
+            if key in state and state[key].shape != value.shape
+        ]
+        problems = []
+        if self.configs.load_strict and missing:
+            problems.append(f"Missing key(s): {missing[:8]}")
+        if self.configs.load_strict and unexpected:
+            problems.append(f"Unexpected key(s): {unexpected[:8]}")
+        if mismatched:
+            problems.append(f"Shape mismatch: {mismatched[:8]}")
+        if problems:
+            raise RuntimeError("Checkpoint does not match model. " + "; ".join(problems))
+
+        incompatible = self.model.load_state_dict(
+            state_dict=state,
             strict=self.configs.load_strict,
         )
         self.model.eval()
+        self.checkpoint_load_seconds = time.perf_counter() - started
+        missing, unexpected = incompatible.missing_keys, incompatible.unexpected_keys
+        self._checkpoint_model = weakref.ref(self.model)
+        self.checkpoint_load_report = {
+            "path": str(checkpoint_path),
+            "strict": bool(self.configs.load_strict),
+            "complete": not missing and not unexpected,
+            "loaded_tensors": len(expected) - len(missing),
+            "model_tensors": len(expected),
+            "missing_keys": list(missing),
+            "unexpected_keys": list(unexpected),
+        }
         self.print("Finish loading checkpoint.")
+        self.print(
+            f"Checkpoint coverage: {len(expected) - len(missing)}/{len(expected)} "
+            f"model tensors loaded; missing={len(missing)}, unexpected={len(unexpected)}"
+        )
+        if missing or unexpected:
+            logger.warning(
+                "Partial checkpoint accepted with load_strict=false: missing=%s, unexpected=%s",
+                missing, unexpected,
+            )
+        self.print(f"Checkpoint load time: {self.checkpoint_load_seconds:.2f}s")
 
         def count_parameters(model: torch.nn.Module) -> float:
             """Count total parameters in millions."""
@@ -174,6 +283,103 @@ class InferenceRunner(object):
             return total_params / 1e6
 
         self.print(f"Model parameters: {count_parameters(self.model):.2f}M")
+
+    @property
+    def checkpoint_loaded(self) -> bool:
+        """Whether the current model completed its requested checkpoint load."""
+        model_ref = getattr(self, "_checkpoint_model", None)
+        return (
+            getattr(self, "checkpoint_load_report", None) is not None
+            and model_ref is not None
+            and model_ref() is getattr(self, "model", None)
+        )
+
+    def _require_checkpoint_loaded(self) -> None:
+        if not self.checkpoint_loaded:
+            raise RuntimeError(
+                "Model is not ready for prediction: no checkpoint has been "
+                "successfully loaded into the current model. Call load_checkpoint() "
+                "after construction or after a failed load."
+            )
+
+    def close(self) -> None:
+        """Release captured graphs and restore the loaded model's forwards.
+
+        A subsequent prediction can enable acceleration again. Close before
+        moving/replacing the model or changing its weights; checkpoint reloads
+        and model reconstruction do this automatically.
+        """
+        finalizer = getattr(self, "_acceleration_finalizer", None)
+        self._acceleration_finalizer = None
+        self._acceleration_key = None
+        self.diffusion_compilation_session = None
+        if finalizer is not None:
+            finalizer()
+
+    def _ensure_diffusion_acceleration(self) -> None:
+        settings = self.model.configs.get("infer_setting", {})
+        supported = self.device.type == "cuda" and self.configs.get("context_parallel_size", 1) == 1
+        compile_enabled = settings.get("compile_diffusion", False)
+        replay_enabled = settings.get("cuda_graphs", False)
+        if not supported or not (compile_enabled or replay_enabled):
+            self.close()
+            return
+        transformer = self.model.diffusion_module.diffusion_transformer
+        existing = getattr(transformer, "_compilation_session", None)
+        owned = getattr(self, "diffusion_compilation_session", None)
+        if existing is not None and existing is not owned:
+            # A caller's explicit context owns its execution switches/lifetime.
+            self.close()
+            return
+        options = {
+            "cuda_graphs": replay_enabled,
+            "max_graphs": settings.get("cuda_graph_max_cache_size", 2),
+            "dynamic_shapes": settings.get("compile_dynamic_shapes", True),
+            "compile_threads": settings.get("compile_threads", 1),
+        }
+        key = (id(self.model), compile_enabled, *options.values())
+        if getattr(self, "_acceleration_key", None) == key:
+            return
+        self.close()
+        if compile_enabled:
+            from mol.model.compiled_diffusion import compiled_diffusion_blocks
+
+            context = compiled_diffusion_blocks(transformer, **options)
+        else:
+            from mol.model.cuda_graph_replay import eager_diffusion_replay
+
+            context = eager_diffusion_replay(transformer, max_graphs=options["max_graphs"])
+        session = context.__enter__()
+        self._acceleration_finalizer = weakref.finalize(self, context.__exit__, None, None, None)
+        self._acceleration_key = key
+        self.diffusion_compilation_session = session
+        self.print(
+            f"Diffusion acceleration: compile={str(bool(compile_enabled)).lower()}, "
+            f"cuda_graphs={options['cuda_graphs']}, "
+            f"max_graphs={options['max_graphs']}, "
+            f"dynamic_shapes={options['dynamic_shapes']}, "
+            f"compile_threads={options['compile_threads']}, "
+            f"fused_layer_norm_modules={session.fused_layer_norm_modules}. "
+            + ("Compiled predictions can differ from eager predictions." if compile_enabled
+               else "Replaying eager kernels without compilation or a LayerNorm backend change.")
+        )
+
+    @contextmanager
+    def _accelerated_prediction(self):
+        self._ensure_diffusion_acceleration()
+        try:
+            yield
+        except BaseException:
+            self.close()
+            raise
+        session = getattr(self, "diffusion_compilation_session", None)
+        if session is not None:
+            self.print(
+                "Diffusion acceleration counters: "
+                f"compiled_calls={session.compiled_calls}, "
+                f"captures={session.graph_captures}, replays={session.graph_replays}, "
+                f"fallbacks={session.graph_fallbacks}, cached={session.graph_cache_entries}"
+            )
 
     def init_dumper(
         self, need_atom_confidence: bool = False, sorted_by_ranking_score: bool = True
@@ -193,6 +399,7 @@ class InferenceRunner(object):
 
     # Adapted from MolTrainer.evaluate in mol/runner/train.py
     @torch.no_grad()
+    @_with_diffusion_acceleration
     def predict(self, data: Mapping[str, Mapping[str, Any]]) -> dict[str, torch.Tensor]:
         """
         Run model prediction on the provided data.
@@ -245,6 +452,7 @@ class InferenceRunner(object):
             logger.info(msg)
 
     @torch.no_grad()
+    @_with_diffusion_acceleration
     def predict_batch(self, inputs, seeds):
         """Run several independent complexes through the batched token networks."""
         precision = {"fp32": torch.float32, "bf16": torch.bfloat16,
@@ -254,6 +462,26 @@ class InferenceRunner(object):
         features = [to_device(data, self.device)["input_feature_dict"] for data in inputs]
         with amp:
             return self.model.forward_batch(features, seeds)
+
+    @torch.no_grad()
+    @_with_diffusion_acceleration
+    def predict_refill(self, batches, on_prediction):
+        """Stream exact-length batches of (key, CPU data, seed) into fixed slots."""
+        from mol.model.refill import forward_refill
+
+        precision = {"fp32": torch.float32, "bf16": torch.bfloat16,
+                     "fp16": torch.float16}[self.configs.dtype]
+        amp = (torch.autocast("cuda", dtype=precision)
+               if self.device.type == "cuda" else nullcontext())
+
+        def features():
+            for items in batches:
+                yield [(key, to_device(data, self.device)["input_feature_dict"], seed)
+                       for key, data, seed in items]
+
+        with amp:
+            self.last_refill_stats = forward_refill(self.model, features(), on_prediction)
+        return self.last_refill_stats
 
     def update_model_configs(self, new_configs: Any) -> None:
         """
@@ -586,6 +814,8 @@ def _failure_hint(error: BaseException) -> str:
             "--infer_setting.chunk_size and --model.msa_module.msa_chunk_size, "
             "or use fewer samples "
             "(--sample in mol pred, --sample_diffusion.N_sample otherwise). "
+            "Disable retained replay buffers with --infer_setting.cuda_graphs false "
+            "and atom caches with --infer_setting.atom_block_cache false if needed. "
             "Above about 1,500 tokens, also run the triangle multiplication on "
             "PyTorch (--trimul_kernel torch in mol pred, "
             "--triangle_multiplicative torch otherwise), whose chunked in-place "
@@ -691,6 +921,16 @@ def infer_predict(runner: InferenceRunner, configs: Any) -> None:
                 if runner.device.type == "cuda":
                     torch.cuda.reset_peak_memory_stats(runner.device)
                 prediction = runner.predict(data)
+                if configs.infer_setting.get("early_stop_ipsae_threshold") is not None:
+                    from mol.runner.batched_prediction import validate_prediction
+
+                    validate_prediction(
+                        prediction, n_atom=len(atom_array), n_token=int(data["N_token"].item()),
+                        n_sample=configs.sample_diffusion.N_sample,
+                        early_stop_threshold=configs.infer_setting.early_stop_ipsae_threshold,
+                    )
+                    logger.info("ipSAE sampling decision for %s: %s", sample_name,
+                                prediction.get("sampling_early_stop", {"reason": "single_sample"}))
 
                 # Regularize the C-terminal carboxyl oxygens (O / OXT) of each
                 # polymer chain: the O<->OXT substructure-permutation symmetry can
@@ -785,6 +1025,7 @@ def main(configs: Any) -> None:
     try:
         infer_predict(runner, configs)
     finally:
+        runner.close()
         if configs.get("context_parallel_size", 1) > 1 and dist.is_initialized():
             dist.destroy_process_group()
 

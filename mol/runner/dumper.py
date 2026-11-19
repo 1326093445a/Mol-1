@@ -19,6 +19,7 @@
 # Upstream file: runner/dumper.py
 
 import os
+import re
 from pathlib import Path
 from typing import List, Optional
 
@@ -97,6 +98,28 @@ class DataDumper:
         dump_dir = self._get_dump_dir(dataset_name, pdb_id, seed)
         Path(dump_dir).mkdir(parents=True, exist_ok=True)
 
+        status_path = Path(dump_dir) / "sampling_status.json"
+        info = pred_dict.get("sampling_early_stop")
+        if info is not None:
+            # Never leave old samples behind when a new run stops earlier.
+            pattern = re.compile(re.escape(pdb_id) + r"(?:_summary_confidence|_full_data)?_sample_(\d+)\.(?:cif|json)$")
+            existing = Path(dump_dir) / "predictions"
+            if existing.exists() and any(
+                (match := pattern.fullmatch(path.name)) and int(match[1]) >= info["completed_samples"]
+                for path in existing.iterdir()
+            ):
+                raise ValueError("Early-stopped output would leave stale samples; use a fresh output directory")
+        write_status = info is not None or status_path.exists()
+        if write_status:
+            count = int(pred_dict["coordinate"].shape[0])
+            status = dict(info) if info is not None else {
+                "requested_samples": count, "completed_samples": count,
+                "skipped_samples": 0, "stopped": False,
+            }
+            status.update({"status": "writing", "seed": int(seed), "name": pdb_id})
+            save_json(status, str(status_path) + ".tmp", indent=4)
+            os.replace(str(status_path) + ".tmp", status_path)
+
         self.dump_predictions(
             pred_dict=pred_dict,
             dump_dir=dump_dir,
@@ -106,6 +129,10 @@ class DataDumper:
             seed=seed,
             ipsae_interface=ipsae_interface,
         )
+        if write_status:
+            status["status"] = "complete"
+            save_json(status, str(status_path) + ".tmp", indent=4)
+            os.replace(str(status_path) + ".tmp", status_path)
 
     def _get_dump_dir(self, dataset_name: str, sample_name: str, seed: int) -> str:
         """

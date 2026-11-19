@@ -18,8 +18,26 @@ from mol.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-def validate_prediction(prediction, *, n_atom, n_token, n_sample):
+def validate_prediction(prediction, *, n_atom, n_token, n_sample, early_stop_threshold=None):
     """Check axes explicitly before associating a result with an input's CIF."""
+    actual = prediction["coordinate"].shape[0]
+    if actual != n_sample:
+        info = prediction.get("sampling_early_stop", {})
+        score = info.get("first_sample_score")
+        allowed = (
+            early_stop_threshold is not None and n_sample > 1 and actual == 1
+            and info.get("stopped") is True
+            and info.get("metric") == "ipsae_min_10"
+            and info.get("threshold") == early_stop_threshold
+            and info.get("requested_samples") == n_sample
+            and info.get("completed_samples") == actual
+            and info.get("skipped_samples") == n_sample - actual
+            and score is not None and 0 <= score <= 1
+            and (score == 0 or score < early_stop_threshold)
+        )
+        if not allowed:
+            raise ValueError("Unexpected sample shortfall without a valid enabled early-stop decision")
+        n_sample = actual
     shapes = {
         "coordinate": (n_sample, n_atom, 3),
         "contact_probs": (n_token, n_token),
@@ -123,6 +141,31 @@ def infer_predict_batched(runner, configs):
         if runner.device.type == "cuda":
             torch.cuda.empty_cache()
 
+    def submit(data, atom_array, seed, pred):
+        pred["coordinate"] = fix_cterminal_carboxyl_oxygens(
+            pred["coordinate"], atom_array
+        )
+        validate_prediction(
+            pred,
+            n_atom=len(atom_array),
+            n_token=int(data["N_token"].item()),
+            n_sample=configs.sample_diffusion.N_sample,
+            early_stop_threshold=configs.infer_setting.get("early_stop_ipsae_threshold"),
+        )
+        writer.submit(
+            dataset_name="",
+            pdb_id=data["sample_name"],
+            seed=seed,
+            pred_dict=pred,
+            atom_array=atom_array,
+            ipsae_interface=data.get("ipsae_interface"),
+            entity_poly_type={
+                k: v
+                for k, v in data["entity_poly_type"].items()
+                if v != "non-polymer"
+            },
+        )
+
     def predict(items):
         started = time.monotonic()
         predictions = None
@@ -169,28 +212,7 @@ def infer_predict_batched(runner, configs):
             completed = 0
             for (data, atom_array, seed), pred in zip(items, predictions, strict=True):
                 try:
-                    pred["coordinate"] = fix_cterminal_carboxyl_oxygens(
-                        pred["coordinate"], atom_array
-                    )
-                    validate_prediction(
-                        pred,
-                        n_atom=len(atom_array),
-                        n_token=int(data["N_token"].item()),
-                        n_sample=configs.sample_diffusion.N_sample,
-                    )
-                    writer.submit(
-                        dataset_name="",
-                        pdb_id=data["sample_name"],
-                        seed=seed,
-                        pred_dict=pred,
-                        atom_array=atom_array,
-                        ipsae_interface=data.get("ipsae_interface"),
-                        entity_poly_type={
-                            k: v
-                            for k, v in data["entity_poly_type"].items()
-                            if v != "non-polymer"
-                        },
-                    )
+                    submit(data, atom_array, seed, pred)
                     completed += 1
                 except Exception:
                     report(data, seed, traceback.format_exc())
@@ -203,6 +225,10 @@ def infer_predict_batched(runner, configs):
                 configs.sample_diffusion.N_sample,
                 time.monotonic() - started,
             )
+            if configs.infer_setting.get("early_stop_ipsae_threshold") is not None:
+                logger.info("ipSAE screening completed sample counts: %s (requested %d per input)",
+                            [int(p["coordinate"].shape[0]) for p in predictions],
+                            configs.sample_diffusion.N_sample)
             if runner.device.type == "cuda":
                 logger.info(
                     "Peak allocated GPU memory: %.3f GiB",
@@ -242,27 +268,32 @@ def infer_predict_batched(runner, configs):
             prefetch=configs.infer_setting.get("prefetch_inputs", 0),
         ) as prepared,
     ):
-        pending, bucket = [], None
-        for seed, data, atom_array, error in prepared:
-            if error:
-                report(data, seed, error)
-                continue
-            current = _precision_bucket(int(data["N_token"].item()))
-            lengths = [int(item[0]["N_token"].item()) for item in pending]
-            lengths.append(int(data["N_token"].item()))
-            if pending and (
-                current != bucket
-                or _exceeds_batch_budget(lengths, configs.infer_setting)
-            ):
+        if configs.infer_setting.get("batch_refill", False):
+            from mol.runner.refill_prediction import run_refill_sessions
+
+            run_refill_sessions(runner, configs, prepared, submit, report)
+        else:
+            pending, bucket = [], None
+            for seed, data, atom_array, error in prepared:
+                if error:
+                    report(data, seed, error)
+                    continue
+                current = _precision_bucket(int(data["N_token"].item()))
+                lengths = [int(item[0]["N_token"].item()) for item in pending]
+                lengths.append(int(data["N_token"].item()))
+                if pending and (
+                    current != bucket
+                    or _exceeds_batch_budget(lengths, configs.infer_setting)
+                ):
+                    predict(pending)
+                    pending = []
+                bucket = current
+                pending.append((data, atom_array, seed))
+                if len(pending) == configs.batch_size:
+                    predict(pending)
+                    pending = []
+            if pending:
                 predict(pending)
-                pending = []
-            bucket = current
-            pending.append((data, atom_array, seed))
-            if len(pending) == configs.batch_size:
-                predict(pending)
-                pending = []
-        if pending:
-            predict(pending)
     if failures:
         raise RuntimeError(
             f"{len(failures)} input/seed prediction(s) failed. First: {failures[0]}"

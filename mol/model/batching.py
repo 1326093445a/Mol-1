@@ -289,13 +289,20 @@ def sample_diffusion_batch(
     gamma_min,
     noise_scale_lambda,
     step_scale_eta,
+    stop_after_first_sample=None,
+    generators=None,
+    numpy_rngs=None,
 ):
     """Same unguided Euler sampler as B=1, with independent unpadded RNG streams."""
-    generators = [
+    if stop_after_first_sample is not None and chunk_size != 1:
+        raise ValueError("First-sample stopping requires chunk_size=1")
+    generators = generators if generators is not None else [
         torch.Generator(device=state[1].device).manual_seed(seed)
         for state, seed in zip(states, seeds, strict=True)
     ]
-    numpy_rngs = [np.random.default_rng(seed) for seed in seeds]
+    numpy_rngs = numpy_rngs if numpy_rngs is not None else [np.random.default_rng(seed) for seed in seeds]
+    if len(generators) != len(states) or len(numpy_rngs) != len(states):
+        raise ValueError("Need one persistent Torch and NumPy generator per input")
     # Decide schedule branches once on the CPU, avoiding a CUDA scalar sync
     # for every input at every denoising step and sample chunk.
     gammas = [
@@ -359,7 +366,91 @@ def sample_diffusion_batch(
             ]
         for output, x in zip(outputs, coords, strict=True):
             output.append(x)
+        if start == 0 and stop_after_first_sample is not None and stop_after_first_sample(coords):
+            break  # Never shrink/repack a batch: stop only the entire group.
     return [torch.cat(output, dim=0) for output in outputs]
+
+
+def prepare_sample_states(model, states, schedules):
+    """Own per-input diffusion conditioning; reusable across sample boundaries."""
+    cfg = model.configs
+    sample_states, sample_schedules = states, schedules
+    if cfg.skip_amp.sample_diffusion:
+        sample_states = []
+        for feat, s_input, s, z, cache in states:
+            local_cache = {
+                "pair_z": None
+                if cache["pair_z"] is None
+                else cache["pair_z"].float(),
+                "p_lm/c_l": [
+                    None if t is None else t.float() for t in cache["p_lm/c_l"]
+                ],
+            }
+            sample_states.append(
+                (feat, s_input.float(), s.float(), z.float(), local_cache)
+            )
+        sample_schedules = [t.float() for t in schedules]
+    if model._inference_diffusion_cache_mode() != "off":
+        for feat, s_input, s, _, local_cache in sample_states:
+            local_cache["single_s"] = (
+                model.diffusion_module.diffusion_conditioning.prepare_single_cache(
+                    s_input, s
+                )
+            )
+            local_cache["conditioned_atom"] = (
+                model.diffusion_module.atom_attention_encoder.prepare_conditioned_cache(
+                    feat["atom_to_token_idx"],
+                    s.unsqueeze(-3),
+                    *local_cache["p_lm/c_l"],
+                    inplace_safe=True,
+                )
+            )
+            if cfg.infer_setting.get("atom_block_cache", False):
+                atom_pair, atom_single = local_cache["conditioned_atom"]
+                for name, module in (
+                    ("atom_encoder_blocks", model.diffusion_module.atom_attention_encoder),
+                    ("atom_decoder_blocks", model.diffusion_module.atom_attention_decoder),
+                ):
+                    local_cache[name] = module.atom_transformer.prepare_inference_cache(
+                        atom_single, atom_pair
+                    )
+    return sample_states, sample_schedules
+
+
+def prepare_batch_conditioning(model, sample_states):
+    """Rebuild batch-wide projections whenever any fixed slot is replaced."""
+    projections, static_pair, attention_bias = None, None, None
+    if model._inference_diffusion_cache_mode() != "off":
+        static_pair = pad_token_tensors(
+            [
+                state[4]["pair_z"].float()
+                if model._inference_diffusion_cache_mode() == "shared"
+                else state[4]["pair_z"]
+                for state in sample_states
+            ],
+            pair=True,
+        )
+        _, attention_bias = token_masks(
+            [state[1].shape[-2] for state in sample_states], static_pair
+        )
+        if model._inference_diffusion_cache_mode() == "full":
+            from mol.model.modules.transformer import ProjectedPairBiases
+
+            projections = model._prepare_projected_pair_biases(static_pair)
+            # Fold the padding mask into each immutable per-block bias once.
+            projections = ProjectedPairBiases(
+                tuple(
+                    block + attention_bias[:, None, None, :, :].to(block)
+                    for block in projections.blocks
+                )
+            )
+            attention_bias = None
+            static_pair = static_pair.unsqueeze(-4)
+        else:
+            static_pair = model.diffusion_module._prepare_diffusion_pair(
+                static_pair.unsqueeze(-4), model.enable_efficient_fusion
+            )
+    return projections, static_pair, attention_bias
 
 
 def forward_batch(model, features: list[dict[str, Any]], seeds: list[int]):
@@ -389,6 +480,9 @@ def forward_batch(model, features: list[dict[str, Any]], seeds: list[int]):
     budget_chunk = max(1, 450_000_000 // (len(features) * n_max * n_max))
     chunk = min(chunk or budget_chunk, budget_chunk)
     trunks = _trunk_batch(model, features, chunk)
+    from mol.model.early_stopping import make_first_sample_gate
+
+    gate = make_first_sample_gate(model, features, trunks, chunk, inplace_safe=True)
     states, schedules = [], []
     for feat, (s_input, s, z) in zip(features, trunks, strict=True):
         cache = model.prepare_inference_cache(feat, z)
@@ -402,76 +496,8 @@ def forward_batch(model, features: list[dict[str, Any]], seeds: list[int]):
         )
 
     def sample(states, schedules):
-        sample_states, sample_schedules = states, schedules
-        if cfg.skip_amp.sample_diffusion:
-            sample_states = []
-            for feat, s_input, s, z, cache in states:
-                local_cache = {
-                    "pair_z": None
-                    if cache["pair_z"] is None
-                    else cache["pair_z"].float(),
-                    "p_lm/c_l": [
-                        None if t is None else t.float() for t in cache["p_lm/c_l"]
-                    ],
-                }
-                sample_states.append(
-                    (feat, s_input.float(), s.float(), z.float(), local_cache)
-                )
-            sample_schedules = [t.float() for t in schedules]
-        projections, static_pair, attention_bias = None, None, None
-        if model._inference_diffusion_cache_mode() != "off":
-            for feat, s_input, s, _, local_cache in sample_states:
-                local_cache["single_s"] = (
-                    model.diffusion_module.diffusion_conditioning.prepare_single_cache(
-                        s_input, s
-                    )
-                )
-                local_cache["conditioned_atom"] = (
-                    model.diffusion_module.atom_attention_encoder.prepare_conditioned_cache(
-                        feat["atom_to_token_idx"],
-                        s.unsqueeze(-3),
-                        *local_cache["p_lm/c_l"],
-                        inplace_safe=True,
-                    )
-                )
-                if cfg.infer_setting.get("atom_block_cache", False):
-                    atom_pair, atom_single = local_cache["conditioned_atom"]
-                    for name, module in (
-                        ("atom_encoder_blocks", model.diffusion_module.atom_attention_encoder),
-                        ("atom_decoder_blocks", model.diffusion_module.atom_attention_decoder),
-                    ):
-                        local_cache[name] = module.atom_transformer.prepare_inference_cache(
-                            atom_single, atom_pair
-                        )
-            static_pair = pad_token_tensors(
-                [
-                    state[4]["pair_z"].float()
-                    if model._inference_diffusion_cache_mode() == "shared"
-                    else state[4]["pair_z"]
-                    for state in sample_states
-                ],
-                pair=True,
-            )
-            _, attention_bias = token_masks(
-                [state[1].shape[-2] for state in sample_states], static_pair
-            )
-            if model._inference_diffusion_cache_mode() == "full":
-                from mol.model.modules.transformer import ProjectedPairBiases
-
-                projections = model._prepare_projected_pair_biases(static_pair)
-                # Fold the padding mask into each immutable per-block bias once.
-                projections = ProjectedPairBiases(
-                    tuple(
-                        block + attention_bias[:, None, None, :, :].to(block)
-                        for block in projections.blocks
-                    )
-                )
-                attention_bias = None
-                static_pair = static_pair.unsqueeze(-4)
-            else:
-                static_pair = model.diffusion_module._prepare_diffusion_pair(
-                    static_pair.unsqueeze(-4), model.enable_efficient_fusion
-                )
+        sample_states, sample_schedules = prepare_sample_states(model, states, schedules)
+        projections, static_pair, attention_bias = prepare_batch_conditioning(model, sample_states)
         return sample_diffusion_batch(
             sample_states,
             lambda x, t: _denoise_batch(
@@ -489,6 +515,7 @@ def forward_batch(model, features: list[dict[str, Any]], seeds: list[int]):
             seeds=seeds,
             n_sample=cfg.sample_diffusion.N_sample,
             chunk_size=cfg.infer_setting.sample_diffusion_chunk_size,
+            stop_after_first_sample=gate,
             **{
                 key: cfg.sample_diffusion[key]
                 for key in (
@@ -505,10 +532,10 @@ def forward_batch(model, features: list[dict[str, Any]], seeds: list[int]):
     )
     del states, schedules, cache
     predictions = []
-    for feat, (s_input, s, z), coordinate in zip(
+    for i, (feat, (s_input, s, z), coordinate) in enumerate(zip(
         features, trunks, coordinates, strict=True
-    ):
-        pred = model.run_inference_heads(
+    )):
+        pred = gate.finish_heads(i, coordinate) if gate else model.run_inference_heads(
             feat,
             s_input,
             s,
@@ -517,5 +544,6 @@ def forward_batch(model, features: list[dict[str, Any]], seeds: list[int]):
             chunk,
             inplace_safe=True,
         )
-        predictions.append(model.summarize_prediction(pred, feat, model.N_cycle))
+        model.summarize_prediction(pred, feat, model.N_cycle)
+        predictions.append(gate.annotate(pred, i) if gate else pred)
     return predictions

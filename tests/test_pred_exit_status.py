@@ -20,7 +20,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from click.testing import CliRunner
 
@@ -30,8 +30,8 @@ from mol.runner import batch_inference, inference
 class PredExitStatusTest(unittest.TestCase):
     def run_pred(self, directory, preprocess=None, predict=None):
         out_dir = Path(directory) / "out"
-        runner = SimpleNamespace(configs={}, error_dir=str(out_dir / "ERR"))
-        with patch.object(batch_inference, "get_default_runner", return_value=runner), \
+        runner = SimpleNamespace(configs={}, error_dir=str(out_dir / "ERR"), close=Mock())
+        with patch.object(batch_inference, "get_default_runner", return_value=runner) as build, \
              patch.object(batch_inference, "preprocess_input",
                           side_effect=preprocess or (lambda path, **kwargs: path)), \
              patch.object(batch_inference, "infer_predict", side_effect=predict) as infer:
@@ -39,6 +39,8 @@ class PredExitStatusTest(unittest.TestCase):
                 batch_inference.mol_cli,
                 ["pred", "-i", str(Path(directory) / "in"), "-o", str(out_dir)],
             )
+        if build.called:
+            runner.close.assert_called_once()
         return result, infer, out_dir / "ERR"
 
     def write_inputs(self, directory, *names):

@@ -240,6 +240,51 @@ def memory_options(command: Any) -> Any:
     """
     for path, option_type, help_text in (
         (
+            "infer_setting.batch_refill",
+            bool,
+            "Experimental fixed-slot refill after first-sample screening (default false). Requires batch_size > 1 and early_stop_ipsae_threshold; only equal token counts share slots.",
+        ),
+        (
+            "infer_setting.early_stop_ipsae_threshold",
+            click.FloatRange(min=0, max=1),
+            "Optional first-sample ipSAE cutoff (e.g. 0.05; default disabled). Stop on zero or below cutoff when every input qualifies, or per input with batch_refill; requires sample/confidence chunks of 1.",
+        ),
+        (
+            "infer_setting.fast_init",
+            bool,
+            "Skip redundant SciPy weight initialization before strict checkpoint loading (default true).",
+        ),
+        (
+            "infer_setting.compile_diffusion",
+            bool,
+            "Compile token diffusion on CUDA (default false; can change predictions). Independent of CUDA replay.",
+        ),
+        (
+            "infer_setting.cuda_graphs",
+            bool,
+            "Replay token diffusion on CUDA (default true; uses eager kernels unless compilation is explicitly enabled; speedup unproven).",
+        ),
+        (
+            "infer_setting.cuda_graph_max_cache_size",
+            click.IntRange(min=1),
+            "Maximum retained CUDA graphs (default 2); extra shapes run without replay.",
+        ),
+        (
+            "infer_setting.compile_dynamic_shapes",
+            bool,
+            "Compile for varying token lengths (default true); replay still uses exact shapes.",
+        ),
+        (
+            "infer_setting.compile_threads",
+            click.IntRange(min=1),
+            "Inductor compilation threads (default 1).",
+        ),
+        (
+            "infer_setting.cpu_thread_limit",
+            click.IntRange(min=0),
+            "Cap PyTorch CPU threads for CUDA inference (default 4); 0 preserves process settings.",
+        ),
+        (
             "infer_setting.prefetch_inputs",
             click.IntRange(min=0),
             "Inputs to prepare ahead in one CPU worker (batch_size > 1); default 0.",
@@ -252,7 +297,7 @@ def memory_options(command: Any) -> Any:
         (
             "infer_setting.atom_block_cache",
             bool,
-            "Cache fixed atom-block conditioning during input batching (default false).",
+            "Cache fixed atom-block conditioning during input batching (default true).",
         ),
         (
             "infer_setting.batch_max_padding_ratio",
@@ -315,6 +360,15 @@ def memory_settings_from_options(options: Mapping[str, Any]) -> dict:
         if value is not None:
             settings[path] = parse_chunk_size(path, value)
     for path in (
+        "infer_setting.early_stop_ipsae_threshold",
+        "infer_setting.batch_refill",
+        "infer_setting.fast_init",
+        "infer_setting.compile_diffusion",
+        "infer_setting.cuda_graphs",
+        "infer_setting.cuda_graph_max_cache_size",
+        "infer_setting.compile_dynamic_shapes",
+        "infer_setting.compile_threads",
+        "infer_setting.cpu_thread_limit",
         "infer_setting.prefetch_inputs",
         "infer_setting.background_write",
         "infer_setting.atom_block_cache",
@@ -552,51 +606,55 @@ def inference_jsons(
                 configs.input_json_path = infer_json
                 infer_predict(runner, configs)
         finally:
+            runner.close()
             import torch.distributed as dist
 
             if dist.is_initialized():
                 dist.destroy_process_group()
         return
-    for infer_json in tqdm.tqdm(infer_jsons):
-        try:
-            configs["input_json_path"] = preprocess_input(
-                infer_json,
-                out_dir=out_dir,
-                use_msa=use_msa,
-                use_template=use_template,
-                use_rna_msa=use_rna_msa,
-                hmmsearch_binary_path=hmmsearch_binary_path,
-                hmmbuild_binary_path=hmmbuild_binary_path,
-                seqres_database_path=seqres_database_path,
-                nhmmer_binary_path=nhmmer_binary_path,
-                hmmalign_binary_path=hmmalign_binary_path,
-                hmmbuild_rna_binary_path=hmmbuild_rna_binary_path,
-                ntrna_database_path=ntrna_database_path,
-                rfam_database_path=rfam_database_path,
-                rna_central_database_path=rna_central_database_path,
-                nhmmer_n_cpu=nhmmer_n_cpu,
-            )
-        except Exception as exc:
-            # The MSA, template or RNA MSA search failed before the model saw
-            # the input; report it where infer_predict reports failed samples.
-            error_message = (
-                f"Preparing {infer_json} failed: {exc}\n{traceback.format_exc()}"
-            )
-            logger.error(error_message)
-            os.makedirs(runner.error_dir, exist_ok=True)
-            stem = os.path.splitext(os.path.basename(infer_json))[0]
-            with open(
-                os.path.join(runner.error_dir, f"{stem}.txt"), "a", encoding="utf-8"
-            ) as f:
-                f.write(error_message)
-            failed_jsons.append(infer_json)
-            continue
-        try:
-            infer_predict(runner, configs)
-        except Exception as exc:
-            # infer_predict has already logged and reported each failed sample.
-            logger.error(f"Predicting {infer_json} failed: {exc}")
-            failed_jsons.append(infer_json)
+    try:
+        for infer_json in tqdm.tqdm(infer_jsons):
+            try:
+                configs["input_json_path"] = preprocess_input(
+                    infer_json,
+                    out_dir=out_dir,
+                    use_msa=use_msa,
+                    use_template=use_template,
+                    use_rna_msa=use_rna_msa,
+                    hmmsearch_binary_path=hmmsearch_binary_path,
+                    hmmbuild_binary_path=hmmbuild_binary_path,
+                    seqres_database_path=seqres_database_path,
+                    nhmmer_binary_path=nhmmer_binary_path,
+                    hmmalign_binary_path=hmmalign_binary_path,
+                    hmmbuild_rna_binary_path=hmmbuild_rna_binary_path,
+                    ntrna_database_path=ntrna_database_path,
+                    rfam_database_path=rfam_database_path,
+                    rna_central_database_path=rna_central_database_path,
+                    nhmmer_n_cpu=nhmmer_n_cpu,
+                )
+            except Exception as exc:
+                # The MSA, template or RNA MSA search failed before the model saw
+                # the input; report it where infer_predict reports failed samples.
+                error_message = (
+                    f"Preparing {infer_json} failed: {exc}\n{traceback.format_exc()}"
+                )
+                logger.error(error_message)
+                os.makedirs(runner.error_dir, exist_ok=True)
+                stem = os.path.splitext(os.path.basename(infer_json))[0]
+                with open(
+                    os.path.join(runner.error_dir, f"{stem}.txt"), "a", encoding="utf-8"
+                ) as f:
+                    f.write(error_message)
+                failed_jsons.append(infer_json)
+                continue
+            try:
+                infer_predict(runner, configs)
+            except Exception as exc:
+                # infer_predict has already logged and reported each failed sample.
+                logger.error(f"Predicting {infer_json} failed: {exc}")
+                failed_jsons.append(infer_json)
+    finally:
+        runner.close()
     if failed_jsons:
         # Keep going through every input, then fail the run: an exit code of
         # zero must mean every structure that was asked for was written.

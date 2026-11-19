@@ -38,7 +38,16 @@ class InferenceDefaultsTest(unittest.TestCase):
         self.assertEqual(configs.mc_dropout_apply_rate, 0.0)
         self.assertEqual(configs.mc_dropout_rate, 0.0)
         self.assertFalse(configs.enable_tf32)
-        self.assertFalse(configs.infer_setting.atom_block_cache)
+        self.assertTrue(configs.infer_setting.fast_init)
+        self.assertTrue(configs.infer_setting.atom_block_cache)
+        self.assertFalse(configs.infer_setting.compile_diffusion)
+        self.assertTrue(configs.infer_setting.cuda_graphs)
+        self.assertIsNone(configs.infer_setting.early_stop_ipsae_threshold)
+        self.assertFalse(configs.infer_setting.batch_refill)
+        self.assertTrue(configs.infer_setting.compile_dynamic_shapes)
+        self.assertEqual(configs.infer_setting.cuda_graph_max_cache_size, 2)
+        self.assertEqual(configs.infer_setting.compile_threads, 1)
+        self.assertEqual(configs.infer_setting.cpu_thread_limit, 4)
         self.assertEqual(configs.infer_setting.prefetch_inputs, 0)
         self.assertFalse(configs.infer_setting.background_write)
         self.assertEqual(configs.infer_setting.sample_diffusion_chunk_size, 1)
@@ -62,6 +71,9 @@ class InferenceDefaultsTest(unittest.TestCase):
         configs = parsed(dict(configs_base))
         self.assertEqual(configs.mc_dropout_apply_rate, 0.4)
         self.assertEqual(configs.infer_setting.sample_diffusion_chunk_size, 5)
+        self.assertFalse(configs.infer_setting.get("compile_diffusion", False))
+        self.assertFalse(configs.infer_setting.get("cuda_graphs", False))
+        self.assertFalse(configs.infer_setting.get("fast_init", False))
 
 
 if __name__ == "__main__":

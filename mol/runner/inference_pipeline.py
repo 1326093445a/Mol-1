@@ -133,7 +133,8 @@ class PredictionWriter:
         kwargs["pred_dict"] = _cpu_copy(
             {
                 key: kwargs["pred_dict"][key]
-                for key in ("coordinate", "summary_confidence", "full_data")
+                for key in ("coordinate", "summary_confidence", "full_data", "sampling_early_stop")
+                if key in kwargs["pred_dict"]
             }
         )
         kwargs["atom_array"] = kwargs["atom_array"].copy()

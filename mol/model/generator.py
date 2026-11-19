@@ -146,6 +146,8 @@ def sample_diffusion(
     attn_chunk_size: Optional[int] = None,
     enable_efficient_fusion: bool = False,
     projected_pair_biases: Optional[ProjectedPairBiases] = None,
+    precompute_schedule_branches: bool = False,
+    stop_after_first_sample: Optional[Callable[[torch.Tensor], bool]] = None,
 ) -> torch.Tensor:
     """Implements Algorithm 18 in AF3.
     It performances denoising steps from time 0 to time T.
@@ -180,11 +182,18 @@ def sample_diffusion(
         projected_pair_biases (Optional[ProjectedPairBiases]): Immutable,
             request-local projected pair biases shared by every denoising step,
             sample chunk and denoising step. Defaults to None.
+        precompute_schedule_branches (bool): Experimental inference optimization;
+            read schedule branch decisions once without changing GPU arithmetic.
+        stop_after_first_sample: Optional inference callback; requires sample
+            chunk size one. True skips later denoiser calls. Global RNG draws
+            are still consumed so later jobs retain their random streams.
 
     Returns:
         torch.Tensor: the denoised coordinates of x in inference stage
             [..., N_sample, N_atom, 3]
     """
+    if stop_after_first_sample is not None and diffusion_chunk_size != 1:
+        raise ValueError("First-sample stopping requires diffusion_chunk_size=1")
     N_atom = input_feature_dict["atom_to_token_idx"].size(-1)
     batch_shape = s_inputs.shape[:-2]
     device = s_inputs.device
@@ -194,12 +203,16 @@ def sample_diffusion(
     seed = input_feature_dict.get("inference_seed")
     generator = None if seed is None else torch.Generator(device=device).manual_seed(int(seed))
     numpy_rng = None if seed is None else np.random.default_rng(int(seed))
+    gammas = (
+        [float(gamma0) if active else 0 for active in (noise_schedule[1:] > gamma_min).tolist()]
+        if precompute_schedule_branches else None
+    )
     request_denoise_net = (
         partial(denoise_net, projected_pair_biases=projected_pair_biases)
         if projected_pair_biases is not None
         else denoise_net
     )
-    def _chunk_sample_diffusion(chunk_n_sample, inplace_safe):
+    def _chunk_sample_diffusion(chunk_n_sample, inplace_safe, noise_only=False):
         # init noise
         # [..., N_sample, N_atom, 3]
         x_l = noise_schedule[0] * torch.randn(
@@ -222,13 +235,18 @@ def sample_diffusion(
 
             # Denoise with a predictor-corrector sampler
             # 1. Add noise to move x_{c_tau_last} to x_{t_hat}
-            gamma = float(gamma0) if c_tau > gamma_min else 0
+            gamma = (
+                gammas[step_i] if gammas is not None
+                else (float(gamma0) if c_tau > gamma_min else 0)
+            )
             t_hat = c_tau_last * (gamma + 1)
 
             delta_noise_level = torch.sqrt(t_hat**2 - c_tau_last**2)
             x_noisy = x_l + noise_scale_lambda * delta_noise_level * torch.randn(
                 size=x_l.shape, device=device, dtype=dtype, generator=generator
             )
+            if noise_only:
+                continue
 
             # 2. Denoise from x_{t_hat} to x_{c_tau}
             # Euler step only
@@ -278,6 +296,14 @@ def sample_diffusion(
                 chunk_n_sample, inplace_safe=inplace_safe
             )
             x_l.append(chunk_x_l)
+            if i == 0 and stop_after_first_sample is not None and stop_after_first_sample(chunk_x_l):
+                if generator is None:
+                    # The ordinary CLI historically shares global RNG streams
+                    # across jobs. Advance only their draws, without running
+                    # the expensive denoiser or confidence for skipped samples.
+                    for _ in range(1, no_chunks):
+                        _chunk_sample_diffusion(1, inplace_safe, noise_only=True)
+                break
         x_l = torch.cat(x_l, -3)  # [..., N_sample, N_atom, 3]
     return x_l
 

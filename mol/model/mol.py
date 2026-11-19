@@ -756,6 +756,12 @@ class Mol(nn.Module):
         cache["projected_pair_biases"] = self._prepare_projected_pair_biases(
             cache["pair_z"]
         )
+        from mol.model.early_stopping import make_first_sample_gate
+
+        gate = make_first_sample_gate(
+            self, [input_feature_dict], [(s_inputs, s, z)], chunk_size,
+            inplace_safe=inplace_safe,
+        ) if mode == "inference" and label_dict is None else None
         pred_dict["coordinate"] = self.sample_diffusion(
             denoise_net=self.diffusion_module,
             input_feature_dict=input_feature_dict,
@@ -770,6 +776,7 @@ class Mol(nn.Module):
             inplace_safe=inplace_safe,
             enable_efficient_fusion=self.enable_efficient_fusion,
             projected_pair_biases=cache["projected_pair_biases"],
+            stop_after_first_sample=(lambda coordinate: gate([coordinate])) if gate else None,
         )
         # These tensors are useful only inside the denoising loop. Drop the
         # request-owned reference before confidence/distogram heads.
@@ -779,7 +786,7 @@ class Mol(nn.Module):
 
         step_diffusion = time.time()
         time_tracker.update({"diffusion": step_diffusion - step_trunk})
-        pred_dict = self.run_inference_heads(
+        pred_dict = gate.finish_heads(0, pred_dict["coordinate"]) if gate else self.run_inference_heads(
             input_feature_dict, s_inputs, s, z, pred_dict["coordinate"], chunk_size,
             inplace_safe=inplace_safe,
         )
@@ -809,6 +816,8 @@ class Mol(nn.Module):
         self.summarize_prediction(
             pred_dict, input_feature_dict, N_cycle, label_dict=label_dict, mode=mode
         )
+        if gate:
+            gate.annotate(pred_dict, 0)
 
         return pred_dict, log_dict, time_tracker
 

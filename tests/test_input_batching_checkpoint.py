@@ -51,7 +51,13 @@ def test_released_checkpoint_batch_matches_seeded_singletons(tmp_path):
             device="cuda",
             load_checkpoint_path=str(checkpoint),
             need_atom_confidence=True,
-            memory_settings={"infer_setting.sample_diffusion_chunk_size": 2},
+            memory_settings={
+                "infer_setting.sample_diffusion_chunk_size": 2,
+                # Preserve this test's historical eager numerical baseline.
+                "infer_setting.compile_diffusion": False,
+                "infer_setting.cuda_graphs": False,
+                "infer_setting.atom_block_cache": False,
+            },
         )
     runner.configs.input_json_path = str(
         Path(__file__).resolve().parents[1] / "examples/no_msa_batch/inputs.json"

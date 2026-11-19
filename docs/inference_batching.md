@@ -25,6 +25,109 @@ Outputs retain the usual layout:
 optional `--need_atom_confidence true` full-data JSON belongs to its own input.
 The default `--batch_size 1` keeps the existing singleton inference path.
 
+## Optional first-sample ipSAE screening
+
+This is a screening policy, disabled by default. Enable it explicitly:
+
+```bash
+mol pred -i inputs.json -o output/screened \
+  --use_msa false --batch_size 2 --sample 5 --cycle 10 --step 200 \
+  --infer_setting.sample_diffusion_chunk_size 1 \
+  --infer_setting.confidence_sample_chunk_size 1 \
+  --infer_setting.early_stop_ipsae_threshold 0.05
+```
+
+The first sample completes all diffusion steps and confidence scoring. The
+decision uses native `ipsae_min_10`, including its normal two-decimal PAE
+rounding and the input's `ipsae_interface`, if supplied. A zero score or a
+score strictly below the threshold qualifies; a score exactly equal to 0.05
+does not qualify at a 0.05 threshold. Threshold zero means stop on exact zero
+only. Omitting the option disables the policy; direct Python configuration
+can set the threshold to `None`.
+
+By default, stopping applies to the **whole input batch** to preserve shapes:
+
+| First scores, threshold 0.05 | Outcome for five requested samples |
+| --- | --- |
+| One input: 0.01 | Keep its first sample; skip four. |
+| Two inputs: 0.01, 0.02 | Keep one sample per input; skip four per input. |
+| Two inputs: 0.01, 0.10 | Generate all five for both inputs. |
+| Any input has undefined ipSAE | Generate all five for every input. |
+
+No input is removed, regrouped or repadded. `--sample 1` is unaffected. Both
+sample chunk sizes must be one when requesting more samples; incompatible
+settings are rejected instead of silently changing shapes. Context-parallel
+inference and multiple model seeds inside one model forward are unsupported.
+Separate CLI seeds remain independent and are each screened. A three-or-more
+protein-chain input needs an explicit interface for a scalar decision; a
+missing scalar is never substituted with zero or the best chain pair.
+
+Trunk recycling runs once, and the first sample's confidence heads are reused.
+Mixed batches retain their original diffusion RNG streams. When ordinary
+single-input inference uses a global RNG stream, skipped noise/augmentation
+draws are still consumed without denoiser calls, preserving the random stream
+for subsequent jobs. Early confidence runs while diffusion caches are still
+resident, so peak memory can increase. Trunk work, featurization and startup
+are not saved; mixed batches can incur extra scoring/setup overhead.
+
+The first sample means **generation index zero**, before confidence ranking.
+It need not be the structure named `sample_0` in an ordinary five-sample run.
+With screening enabled, summaries include `sample_generation_index` and
+`sampling_early_stop` with the first score, threshold, reason and requested,
+completed and skipped counts. Each seed also has `sampling_status.json` beside
+`predictions/`; `status: "complete"` is written atomically only after successful
+output. Resume systems must use this intentional-completion record rather
+than require five files after an early stop. Existing external launchers have
+not been changed. Reusing a directory containing extra samples from an older
+run is rejected; choose a fresh output directory rather than mixing outputs.
+
+A low first score does not establish that later samples would also be low.
+Measure that loss on existing complete multi-sample predictions before using
+the policy for a screening campaign. Output equivalence on retained samples
+does not validate the decision to discard ungenerated samples.
+
+### Experimental fixed-slot refill
+
+Add `--infer_setting.batch_refill true` to screen each input independently and
+fill its slot with another compatible job after it stops or finishes. This
+option is **off by default** and requires `batch_size > 1`, an explicit ipSAE
+threshold, more than one sample, and both sample chunk sizes set to one.
+
+For example, in a batch of two, A fails after sample one while B passes. A is
+written with one sample. C starts sample one in A's slot while B generates
+sample two. B stays in the same slot with the same Torch and NumPy generators.
+Replacement happens only between complete diffusion samples; first-sample
+confidence is reused. Incoming jobs still pay their full trunk/recycling cost.
+
+Only consecutive jobs with **exactly equal featurized token counts** share a
+refill session, regardless of the padding-ratio setting. Trunks are prepared in
+groups of the configured batch size; a partial final group repeats conditioning
+in placeholder slots. Diffusion also keeps that batch size until the last real
+job completes. Placeholders emit no files. All atom caches and batch-wide pair
+projections are refreshed when slots change. Eager replay copies the new inputs
+into its captured buffers; the LayerNorm backend and precision settings stay
+unchanged. This preserves tensor dimensions, but numerical identity for every
+backend and input still requires validation. Compare against controls at the
+same fixed B: ordinary inference may use a smaller B for its partial tail,
+which is a different numerical configuration.
+
+The scheduler retains at most B active and B-1 queued real jobs between trunk
+preparations. Preparing another group and scoring early can increase peak GPU
+memory. A `batch_max_pair_tokens` budget smaller than B times the squared token
+count is rejected. OOM does not silently retry a refill session with smaller B:
+unfinished jobs in that exact-length session are reported as failures, while
+completed outputs remain valid. Later lengths can start new sessions.
+
+Output metadata uses `batch_policy: "preserve_shape_refill"` and records B.
+Completion order may differ from input order; output names and seeds retain
+their owners. The Python entry point is
+`runner.predict_refill(batches, on_prediction)`, where each preparation batch
+contains `(key, data, seed)` triples and the callback receives `(key, prediction)`.
+Use a separate session for each token length. Consume or copy each prediction
+in the callback to keep memory bounded. The CLI handles grouping, writing and
+failure reporting automatically. Refill remains an experimental throughput
+option; it does not validate the scientific loss from first-sample screening.
+
 ## Execution and supported settings
 
 The PairMixer/Pairformer trunk and diffusion token transformer run batched.
@@ -409,13 +512,13 @@ comparisons use the saved full-precision tensors and native summary values.
 
 ## Reusing fixed atom-block conditioning
 
-An opt-in cache prepares the encoder and decoder atom blocks' fixed
+A request-local cache prepares the encoder and decoder atom blocks' fixed
 pair-bias projections, adaptive LayerNorm affine terms and output gates once
 per input during mixed-input diffusion. Each denoising step still computes attention on the changing atom
 representations. The cache is local to one prediction request, shared across
 sample chunks, and never registered on the model or checkpoint. It is enabled
 with `--infer_setting.atom_block_cache true` and the existing `full` or `shared`
-diffusion-cache modes; its default is **false**, and `off` retains the
+diffusion-cache modes; its default is now **true**, and `off` retains the
 uncached path. Gradient-enabled execution and training ignore the cache.
 
 This change currently applies to `predict_batch`, including a partial batch of
@@ -469,7 +572,7 @@ implementations. Shared-GPU full-model timings were:
 | Deterministic | 100.38 | 102.33 |
 
 Those shared-GPU measurements showed no full-model gain. A subsequent isolated
-comparison is recorded below; caching remains opt-in because the measured gain
+comparison is recorded below; caching was initially opt-in because the measured gain
 has only been validated on a small cohort.
 
 The instrumented real-input trunk pass identified triangle attention as the
@@ -503,7 +606,7 @@ cached warmup followed by uncached/cached/cached/uncached timed passes:
 Caching reduced model time by **3.52%**. Peak allocated memory was 44.46 GiB for
 both. Coordinates, PAE, atom pLDDT, native ipSAE and rankings matched bitwise,
 including repeats. No competing GPU process was observed. This supports using
-the opt-in cache for similar workloads; it does not establish a universal gain.
+the cache for similar workloads; it does not establish a universal gain.
 The report is `output/mol1_targeted_pass/cache/predictions/report.json`.
 
 ### Triangle attention layout

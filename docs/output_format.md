@@ -55,6 +55,8 @@ scores. `n_chain` below is the number of chains in the job.
 | `ipsae_chain_pairs` | list | Protein chain pairs with their actual CIF chain labels, both directional scores, and both minima. |
 | `ipsae_interface` | object, when requested | Selected `chains_1` and `chains_2` lists, both directional scores, and both minima, scored over pooled residues. |
 | `ipsae_parameters` | object | Cutoff, PAE rounding precision, and both count clips used for the calculation. |
+| `sample_generation_index` | integer, with early-stop screening | Original zero-based diffusion sample index, before ranking. |
+| `sampling_early_stop` | object, with early-stop screening | First-sample score, threshold, batch policy, stop reason, and requested/completed/skipped sample counts. |
 
 Two things that surprise people:
 
@@ -65,6 +67,18 @@ Two things that surprise people:
   chain paired with itself has no interface to score.
 
 ### Native ipSAE
+
+Optional first-sample screening can deliberately produce fewer than `--sample`
+structures. Its decision uses generation index zero, not the final top-ranked
+filename. A seed-level `sampling_status.json` beside `predictions/` records
+`status: "complete"` only after the retained files have been written. Resume
+tools should honor its requested/completed/skipped counts; an absent or
+`"writing"` record does not establish successful early completion. See
+[the screening policy](inference_batching.md#optional-first-sample-ipsae-screening).
+With experimental slot refill, the same records use
+`batch_policy: "preserve_shape_refill"`. Completed jobs may be written out of
+input order; each retains its own job name and seed. Placeholder slots produce
+no output, and background writing preserves the completion record.
 
 Every normal prediction writes ipSAE into its summary without another model
 pass or an external scoring script. Without an explicit interface selection,

@@ -24,7 +24,7 @@ import os
 from pathlib import Path
 
 from mol.config.base import model_configs as base_model_configs
-from mol.config.types import ListValue, RequiredValue, ValueMaybeNone
+from mol.config.types import DefaultNoneWithType, ListValue, RequiredValue, ValueMaybeNone
 
 MOL_ROOT_DIR = os.environ.get("MOL_ROOT_DIR", str(Path.home()))
 inference_configs = {
@@ -58,10 +58,21 @@ inference_configs = {
     "mc_dropout_rate": 0.0,
     "infer_setting": {
         **base_model_configs["infer_setting"],
+        # Skip SciPy weight initialization only before strict checkpoint loading.
+        "fast_init": True,
+        # Replay the eager token stack without changing kernels or compilation.
+        # Compilation remains opt-in because it can change predictions.
+        "compile_diffusion": False,
+        "cuda_graphs": True,
+        "cuda_graph_max_cache_size": 2,
+        "compile_dynamic_shapes": True,
+        "compile_threads": 1,
+        "cpu_thread_limit": 4,  # CUDA host threads; 0 leaves process settings alone.
         "sample_diffusion_chunk_size": ValueMaybeNone(1),
         "confidence_sample_chunk_size": ValueMaybeNone(1),
-        # Opt-in: measured gains are modest and validated on a small real cohort.
-        "atom_block_cache": False,
+        "early_stop_ipsae_threshold": DefaultNoneWithType(float),
+        "batch_refill": False,  # Experimental fixed-slot first-sample screening.
+        "atom_block_cache": True,
         "prefetch_inputs": 0,  # Bounded CPU worker queue; 0 keeps serial preparation.
         "background_write": False,  # One CPU-only output job at a time.
         # Zero disables either scheduling limit. These never alter N_sample.
@@ -71,8 +82,47 @@ inference_configs = {
 }
 
 
+def validate_inference_acceleration(configs):
+    """Validate controls before loading model assets, including direct API use."""
+    settings = configs.get("infer_setting", {})
+    for name, default, minimum in (
+        ("cuda_graph_max_cache_size", 2, 1),
+        ("compile_threads", 1, 1),
+        ("cpu_thread_limit", 4, 0),
+    ):
+        value = settings.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"infer_setting.{name} must be an integer >= {minimum}")
+    validate_early_stopping(configs)
+
+
+def validate_early_stopping(configs):
+    """Reject settings that would silently change sample or input shapes."""
+    settings = configs.get("infer_setting", {})
+    threshold = settings.get("early_stop_ipsae_threshold")
+    if settings.get("batch_refill", False):
+        if configs.get("batch_size", 1) < 2 or threshold is None or configs.sample_diffusion.N_sample <= 1:
+            raise ValueError("batch_refill requires batch_size > 1, an early_stop_ipsae_threshold and N_sample > 1")
+        if configs.get("context_parallel_size", 1) != 1:
+            raise ValueError("batch_refill does not support context parallelism")
+    if threshold is None:
+        return
+    if isinstance(threshold, bool) or not isinstance(threshold, (float, int)) or not math.isfinite(threshold) or not 0 <= threshold <= 1:
+        raise ValueError("early_stop_ipsae_threshold must be finite and in [0, 1], or None")
+    if configs.sample_diffusion.N_sample <= 1:
+        return
+    for key in ("sample_diffusion_chunk_size", "confidence_sample_chunk_size"):
+        if settings.get(key, 1) != 1:
+            raise ValueError(f"ipSAE early stopping requires infer_setting.{key}=1 to preserve sample shapes")
+    if configs.get("context_parallel_size", 1) != 1:
+        raise ValueError("ipSAE early stopping does not support context parallelism")
+    if configs.model.N_model_seed != 1 or configs.get("mc_dropout_apply_rate", 0) != 0:
+        raise ValueError("ipSAE early stopping requires N_model_seed=1 and no Monte Carlo dropout")
+
+
 def validate_input_batching(configs, *, batch_size=None):
     """Check the supported no-MSA inference mode before loading model assets."""
+    validate_early_stopping(configs)
     size = configs.get("batch_size", 1) if batch_size is None else batch_size
     if isinstance(size, bool) or not isinstance(size, int) or size < 1:
         raise ValueError("batch_size must be a positive integer")

@@ -231,6 +231,8 @@ __global__ void LayerNormForwardV2(T* input, T* output, T* gamma, T* beta,
 void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, at::Tensor* input,
                      int rows, int cols, at::IntArrayRef normalized_shape, at::Tensor* gamma,
                      at::Tensor* beta, double epsilon) {
+    // Honor the caller's stream, including CUDA graph capture on a side stream.
+    const auto stream = at::cuda::getCurrentCUDAStream().stream();
     // Get element byte size
     const auto dtype = output->dtype();
     int element_size;
@@ -268,7 +270,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
     // Type dispatch
     if (dtype == torch::kFloat32) {
         if (vec_size == 16) {
-            LayerNormForwardV2<float, float4><<<grid, block>>>(
+            LayerNormForwardV2<float, float4><<<grid, block, 0, stream>>>(
                 static_cast<float*>(input->data_ptr()),
                 static_cast<float*>(output->data_ptr()),
                 gamma ? static_cast<float*>(gamma->data_ptr()) : nullptr,
@@ -278,7 +280,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 8) {
-            LayerNormForwardV2<float, float2><<<grid, block>>>(
+            LayerNormForwardV2<float, float2><<<grid, block, 0, stream>>>(
                 static_cast<float*>(input->data_ptr()),
                 static_cast<float*>(output->data_ptr()),
                 gamma ? static_cast<float*>(gamma->data_ptr()) : nullptr,
@@ -288,7 +290,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 4) {
-            LayerNormForwardV2<float, float><<<grid, block>>>(
+            LayerNormForwardV2<float, float><<<grid, block, 0, stream>>>(
                 static_cast<float*>(input->data_ptr()),
                 static_cast<float*>(output->data_ptr()),
                 gamma ? static_cast<float*>(gamma->data_ptr()) : nullptr,
@@ -301,7 +303,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
     }
     else if (dtype == torch::kFloat16) {
                 if (vec_size == 16) {  // Use float4 to handle half type (8 elements)
-            LayerNormForwardV2<at::Half, float4><<<grid, block>>>(
+            LayerNormForwardV2<at::Half, float4><<<grid, block, 0, stream>>>(
                 static_cast<at::Half*>(input->data_ptr()),
                 static_cast<at::Half*>(output->data_ptr()),
                 gamma ? static_cast<at::Half*>(gamma->data_ptr()) : nullptr,
@@ -311,7 +313,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 8) {  // float2 to handle 4 half elements
-            LayerNormForwardV2<at::Half, float2><<<grid, block>>>(
+            LayerNormForwardV2<at::Half, float2><<<grid, block, 0, stream>>>(
                 static_cast<at::Half*>(input->data_ptr()),
                 static_cast<at::Half*>(output->data_ptr()),
                 gamma ? static_cast<at::Half*>(gamma->data_ptr()) : nullptr,
@@ -321,7 +323,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 4) {  // float to handle 2 half elements
-            LayerNormForwardV2<at::Half, float><<<grid, block>>>(
+            LayerNormForwardV2<at::Half, float><<<grid, block, 0, stream>>>(
                 static_cast<at::Half*>(input->data_ptr()),
                 static_cast<at::Half*>(output->data_ptr()),
                 gamma ? static_cast<at::Half*>(gamma->data_ptr()) : nullptr,
@@ -331,7 +333,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 2) {
-            LayerNormForwardV2<at::Half, at::Half><<<grid, block>>>(
+            LayerNormForwardV2<at::Half, at::Half><<<grid, block, 0, stream>>>(
                 static_cast<at::Half*>(input->data_ptr()),
                 static_cast<at::Half*>(output->data_ptr()),
                 gamma ? static_cast<at::Half*>(gamma->data_ptr()) : nullptr,
@@ -344,7 +346,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
     }
     else if (dtype == torch::kBFloat16) {
         if (vec_size == 16) {
-            LayerNormForwardV2<at::BFloat16, float4><<<grid, block>>>(
+            LayerNormForwardV2<at::BFloat16, float4><<<grid, block, 0, stream>>>(
                 static_cast<at::BFloat16*>(input->data_ptr()),
                 static_cast<at::BFloat16*>(output->data_ptr()),
                 gamma ? static_cast<at::BFloat16*>(gamma->data_ptr()) : nullptr,
@@ -354,7 +356,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 8) {
-            LayerNormForwardV2<at::BFloat16, float2><<<grid, block>>>(
+            LayerNormForwardV2<at::BFloat16, float2><<<grid, block, 0, stream>>>(
                 static_cast<at::BFloat16*>(input->data_ptr()),
                 static_cast<at::BFloat16*>(output->data_ptr()),
                 gamma ? static_cast<at::BFloat16*>(gamma->data_ptr()) : nullptr,
@@ -364,7 +366,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 4) {
-            LayerNormForwardV2<at::BFloat16, float><<<grid, block>>>(
+            LayerNormForwardV2<at::BFloat16, float><<<grid, block, 0, stream>>>(
                 static_cast<at::BFloat16*>(input->data_ptr()),
                 static_cast<at::BFloat16*>(output->data_ptr()),
                 gamma ? static_cast<at::BFloat16*>(gamma->data_ptr()) : nullptr,
@@ -374,7 +376,7 @@ void cuda_layer_norm(at::Tensor* output, at::Tensor* mean, at::Tensor* invvar, a
                 long(rows), long(cols), float(epsilon)
             );
         } else if (vec_size == 2) {
-            LayerNormForwardV2<at::BFloat16, at::BFloat16><<<grid, block>>>(
+            LayerNormForwardV2<at::BFloat16, at::BFloat16><<<grid, block, 0, stream>>>(
                 static_cast<at::BFloat16*>(input->data_ptr()),
                 static_cast<at::BFloat16*>(output->data_ptr()),
                 gamma ? static_cast<at::BFloat16*>(gamma->data_ptr()) : nullptr,

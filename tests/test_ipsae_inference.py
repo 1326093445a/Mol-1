@@ -135,3 +135,16 @@ def test_invalid_selection_fails_during_data_loading(monkeypatch, interface_inpu
     assert atoms is None
     assert "ipsae_interface chain 'missing' has no protein CA tokens" in error
     template.assert_not_called()
+
+
+def test_early_stop_uses_exact_ca_groups_and_interface(interface_inputs):
+    cfg = interface_inputs
+    cfg.infer_setting.early_stop_ipsae_threshold = .05
+    dataset = infer_dataloader.InferenceDataset(cfg)
+    data, _, error = dataset[0]
+    assert not error
+    metadata = data['input_feature_dict']['ipsae_early_stop']
+    assert metadata['interface'] == [['A'], ['B', 'C']]
+    assert {key: value.tolist() for key, value in metadata['groups'].items()} == {
+        'A': [0, 1], 'B': [2, 3], 'C': [4, 5],
+    }

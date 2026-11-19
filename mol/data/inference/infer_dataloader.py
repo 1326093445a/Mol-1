@@ -191,6 +191,15 @@ class InferenceDataset(Dataset):
 
         # Transform to right data type
         feat = data_type_transform(feat_or_label_dict=features_dict)
+        if self.configs.infer_setting.get("early_stop_ipsae_threshold") is not None:
+            # Exact output-chain labels and CA representatives, including
+            # modified residues and caller-selected multi-chain interfaces.
+            feat["ipsae_early_stop"] = {
+                "groups": protein_token_groups(
+                    atom_array, feat["atom_to_token_idx"], len(token_array)
+                ),
+                "interface": ipsae_interface,
+            }
 
         t2 = time.time()
 

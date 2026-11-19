@@ -49,6 +49,7 @@ class PredMemoryOptionsTest(unittest.TestCase):
             "--model.msa_module.msa_chunk_size", "512",
             "--infer_setting.diffusion_conditioning_row_chunk_size", "none",
             "--infer_setting.dynamic_chunk_size", "true",
+            "--infer_setting.fast_init", "true",
             "--infer_setting.atom_block_cache", "true",
             "--infer_setting.prefetch_inputs", "2",
             "--infer_setting.background_write", "true",
@@ -62,6 +63,7 @@ class PredMemoryOptionsTest(unittest.TestCase):
                 "model.msa_module.msa_chunk_size": 512,
                 "infer_setting.diffusion_conditioning_row_chunk_size": None,
                 "infer_setting.dynamic_chunk_size": True,
+                "infer_setting.fast_init": True,
                 "infer_setting.atom_block_cache": True,
                 "infer_setting.prefetch_inputs": 2,
                 "infer_setting.background_write": True,
@@ -76,6 +78,58 @@ class PredMemoryOptionsTest(unittest.TestCase):
                 self.assertEqual(result.exit_code, 2, result.output)
                 self.assertIn("--infer_setting.chunk_size", result.output)
                 self.assertIsNone(kwargs)
+
+    def test_acceleration_can_be_disabled_and_sized(self):
+        settings = {
+            "infer_setting.fast_init": "false",
+            "infer_setting.compile_diffusion": "false",
+            "infer_setting.cuda_graphs": "false",
+            "infer_setting.compile_dynamic_shapes": "false",
+            "infer_setting.cuda_graph_max_cache_size": "3",
+            "infer_setting.compile_threads": "2",
+            "infer_setting.cpu_thread_limit": "0",
+            "infer_setting.atom_block_cache": "false",
+        }
+        result, kwargs = self.invoke_pred(*[value for key, value in settings.items() for value in ("--" + key, value)])
+        self.assertEqual(result.exit_code, 0, result.output)
+        expected = {key: (False if value == "false" else int(value)) for key, value in settings.items()}
+        self.assertEqual(kwargs["memory_settings"], expected)
+
+    def test_compilation_and_replay_can_be_explicitly_enabled(self):
+        result, kwargs = self.invoke_pred(
+            "--infer_setting.compile_diffusion", "true",
+            "--infer_setting.cuda_graphs", "true",
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(kwargs["memory_settings"], {
+            "infer_setting.compile_diffusion": True,
+            "infer_setting.cuda_graphs": True,
+        })
+
+    def test_early_stop_threshold_reaches_runner(self):
+        result, kwargs = self.invoke_pred("--infer_setting.early_stop_ipsae_threshold", "0.05")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(kwargs['memory_settings'], {'infer_setting.early_stop_ipsae_threshold': .05})
+        for value in ('-0.1', '1.1'):
+            result, _ = self.invoke_pred("--infer_setting.early_stop_ipsae_threshold", value)
+            self.assertEqual(result.exit_code, 2)
+
+    def test_batch_refill_reaches_runner(self):
+        result, kwargs = self.invoke_pred(
+            "--batch_size", "2", "--use_msa", "false",
+            "--infer_setting.batch_refill", "true",
+            "--infer_setting.early_stop_ipsae_threshold", "0.05",
+        )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(kwargs['memory_settings'], {
+            'infer_setting.batch_refill': True, 'infer_setting.early_stop_ipsae_threshold': .05,
+        })
+
+    def test_bad_acceleration_limits_are_usage_errors(self):
+        for name, value in (("cuda_graph_max_cache_size", "0"), ("compile_threads", "0"), ("cpu_thread_limit", "-1")):
+            result, kwargs = self.invoke_pred("--infer_setting." + name, value)
+            self.assertEqual(result.exit_code, 2, result.output)
+            self.assertIsNone(kwargs)
 
     def test_sample_and_padding_controls_reach_runner(self):
         result, kwargs = self.invoke_pred(
@@ -124,6 +178,8 @@ class PredMemoryOptionsTest(unittest.TestCase):
         self.assertIsNone(configs.infer_setting.diffusion_conditioning_row_chunk_size)
         self.assertEqual(configs.diffusion_cache_mode, "off")
         # Untouched settings keep their inference defaults.
+        self.assertFalse(configs.infer_setting.compile_diffusion)
+        self.assertTrue(configs.infer_setting.cuda_graphs)
         self.assertEqual(
             configs.infer_setting.trunk_pairformer_transition_chunk_size,
             batch_inference.inference_default(

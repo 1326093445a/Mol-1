@@ -62,6 +62,20 @@ prediction does not fit, turn the knobs below and run it again.
 | `infer_setting.diffusion_conditioning_row_chunk_size` | pair-conditioning rows | 768 |
 | `infer_setting.lddt_metrics_chunk_size` | metric computation | 1 |
 | `diffusion_cache_mode` | what the diffusion module reuses across steps | `full` |
+| `infer_setting.atom_block_cache` | fixed atom-block conditioning in input batching | on |
+| `infer_setting.compile_diffusion` | optional compiled token diffusion on CUDA; independent of replay | off |
+| `infer_setting.cuda_graphs` | replay eager token kernels by default, retaining graph/input buffers | on |
+| `infer_setting.cuda_graph_max_cache_size` | maximum retained graph signatures; extra shapes run without replay | 2 |
+
+CUDA replay is enabled independently of compilation and preserves the selected
+LayerNorm implementation. Its production speed benefit has not been established.
+Graph buffers add to peak memory; use `--infer_setting.cuda_graphs false` to
+disable them. Enable compilation separately with
+`--infer_setting.compile_diffusion true`. The runner releases retained graphs on checkpoint
+reload, reconstruction and CLI exit; Python callers can use `runner.close()`.
+Compilation can change coordinates; see the
+[current defaults and numerical validation](inference_optimization_summary.md#current-inference-defaults).
+The older memory measurements above predate compilation and replay support.
 
 `infer_setting.sample_diffusion_chunk_size` is 1, so the diffusion module
 denoises the samples one at a time and its memory does not grow with the

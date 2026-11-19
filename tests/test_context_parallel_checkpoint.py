@@ -44,7 +44,12 @@ def test_context_parallel_checkpoint(tmp_path):
             n_sample=2,
             need_atom_confidence=True,
             load_checkpoint_path=str(checkpoint),
-            memory_settings={"infer_setting.sample_diffusion_chunk_size": 2},
+            memory_settings={
+                "infer_setting.sample_diffusion_chunk_size": 2,
+                # Compare parallelism against its historical eager reference.
+                "infer_setting.compile_diffusion": False,
+                "infer_setting.cuda_graphs": False,
+            },
         )
     try:
         runner.configs.input_json_path = str(

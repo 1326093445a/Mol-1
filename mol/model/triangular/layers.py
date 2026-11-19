@@ -25,6 +25,8 @@ import importlib
 import logging
 import math
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial, partialmethod
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -119,9 +121,29 @@ def _calculate_fan(
     return f
 
 
+_SKIP_TRUNC_NORMAL_INIT = ContextVar("skip_trunc_normal_init", default=False)
+
+
+@contextmanager
+def skip_trunc_normal_init():
+    """Skip redundant SciPy draws while building a model for strict loading.
+
+    Other initializers and non-checkpoint state retain their normal behavior.
+    The flag is local to this context, including across threads and exceptions.
+    Callers must load a complete checkpoint before using the resulting model.
+    """
+    token = _SKIP_TRUNC_NORMAL_INIT.set(True)
+    try:
+        yield
+    finally:
+        _SKIP_TRUNC_NORMAL_INIT.reset(token)
+
+
 def trunc_normal_init_(
     weights: torch.Tensor, scale: float = 1.0, fan: str = "fan_in"
 ) -> None:
+    if _SKIP_TRUNC_NORMAL_INIT.get():
+        return
     shape = weights.shape
     f = _calculate_fan(shape, fan)
     scale = scale / max(1, f)

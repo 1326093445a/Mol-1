@@ -80,6 +80,46 @@ The easiest way to run Mol-1 prediction is:
 mol pred -i /path/to/input/json -o /path/to/output/dir
 ```
 
+**Startup and model reuse.** Strict checkpoint loading skips redundant SciPy
+weight initialization by default (`--infer_setting.fast_init false` disables
+this). CUDA inference caps PyTorch CPU threads at four; set
+`--infer_setting.cpu_thread_limit 0` to retain the process settings.
+To reuse one loaded model across several input files,
+pass a directory of job JSONs to `-i`; the CLI loads the model once and visits
+each file. Startup logs report checkpoint tensor coverage and effective CPU
+thread counts. See [startup optimization](docs/inference_optimization_summary.md#startup-and-model-reuse)
+for validation, timing scope and resume behavior.
+
+**CUDA replay and optional compilation.** CUDA inference defaults to replaying
+the eager token-diffusion kernels, retaining the selected LayerNorm backend.
+The runner caches up to two exact graph signatures; other shapes run without
+replay. Disable replay with `--infer_setting.cuda_graphs false`. A production
+speedup has not been established; graph buffers require additional GPU memory.
+Compilation remains off by default and can change predictions even with fused
+LayerNorm retained: the 8cnh compilation test measured a 2.407 Å maximum
+coordinate-component change. Opt in separately with
+`--infer_setting.compile_diffusion true`. Input batching keeps
+atom-block caching enabled by default. Keep LayerNorm, grouping, batch size and
+execution mode fixed across scores compared in one pool. See
+[defaults and validation](docs/inference_optimization_summary.md#current-inference-defaults)
+for controls, measurements and API resource management.
+
+**Optional first-sample screening.** Add
+`--infer_setting.early_stop_ipsae_threshold 0.05` to finish and score the first
+generated sample, then skip remaining samples if its `ipsae_min_10` is zero or
+below 0.05. This is off by default and requires diffusion/confidence sample
+chunks of one. With multiple inputs, **every input in the batch must fail**;
+mixed batches finish all samples without shrinking or repacking. Undefined
+ipSAE never triggers stopping. A later sample can have a better score, so this
+heuristic trades sampling coverage for compute. See
+[early stopping and completion records](docs/inference_batching.md#optional-first-sample-ipsae-screening).
+
+For experimental independent screening within a batch, also add
+`--infer_setting.batch_refill true`. Compatible incoming jobs replace finished
+slots between samples while the batch size stays fixed. This is disabled by
+default; see [fixed-slot refill](docs/inference_batching.md#experimental-fixed-slot-refill)
+for exact-length restrictions and memory costs.
+
 **Input format**. `Mol-1`'s input is a list of "jobs" described by JSON, where each job's `sequences` holds `proteinChain`, `dnaSequence`, `rnaSequence`, `ligand` or `ion` entries, with optional
 `covalent_bonds` and residue modifications. Template hits are accepted as
 `.a3m`, `.hhr` or JSON. See the details in [input JSON format](docs/infer_json_format.md) and
