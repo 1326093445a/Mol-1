@@ -1190,6 +1190,8 @@ it provides no ipSAE-equivalence evidence. Each execution mode repeated bitwise
 within its own path. The run used **one capture and 600 replays**, with zero
 capacity fallbacks and no additional warmed captures.
 
+The November 2026 antibody–antigen benchmark also compared the fused and PyTorch LayerNorm backends on 35 pairs, including cases near zero and near the 0.7 ipSAE cutoff. [Paired ipSAE results](inference_performance_at_a_glance.md#antibody-antigen-ipsae-and-binder-ranking)
+
 **Retaining fused LayerNorm removes the backend-switch confound; it does not
 make compilation preserve eager predictions.** The 2.407 Å local coordinate
 change is material even though aggregate RMSE is smaller. This experiment does
