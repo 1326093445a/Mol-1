@@ -65,23 +65,26 @@ def cuequivariance_is_available() -> bool:
     return True
 
 
-def resolve_auto_kernel(setting: str, device: torch.device) -> str:
+def resolve_auto_kernel(setting: str, device: torch.device, *, training: bool = False) -> str:
     """Resolve ``auto`` for a triangle kernel setting to a concrete backend.
 
     The cuEquivariance kernels are CUDA-only, so ``auto`` selects them when the
     model is on CUDA and they import, and the PyTorch path otherwise -- which
     is the only backend available on CPU and MPS.
 
-    ``auto`` never selects ``flashpairformer``: it needs an optional
-    dependency that a user installs deliberately, and silently opting someone
-    into a different kernel is exactly what the explicit settings exist to
-    prevent. Request it by name.
+    For inference multiplication, prefer FlashPairformer when its optional
+    package and the cuEquivariance fallback are both available.
 
     A backend is never substituted silently for a *requested* one; this only
     resolves the explicit ``auto`` request.
     """
     if device.type == "cuda":
         if cuequivariance_is_available():
+            if setting == "triangle_multiplicative" and not training:
+                from mol.model.triangular.flashpairformer import flashpairformer_is_available
+
+                if flashpairformer_is_available():
+                    return "flashpairformer"
             return "cuequivariance"
         logger.info(
             "%s=auto resolved to torch: cuEquivariance is not importable. "

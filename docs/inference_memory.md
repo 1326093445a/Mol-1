@@ -12,7 +12,7 @@ N_token 1000, peak device memory 29427 MiB. Results saved to ./output
 
 Run the three bundled systems in `examples/example_without_msa.json` and you
 have a curve for your own card. For orientation, three FoldBench inputs with
-the `mol pred` defaults (20 cycles, 200 diffusion steps, 5 samples,
+the settings used for the original benchmark (20 cycles, 200 diffusion steps, 5 samples,
 cuEquivariance kernels, BF16 with the diffusion module and confidence head in
 FP32) but TF32 on, on one 95 GiB NVIDIA Blackwell GPU:
 
@@ -58,11 +58,12 @@ prediction does not fit, turn the knobs below and run it again.
 | `infer_setting.msa_pair_transition_chunk_size` | pair transition inside the MSA module | 1024 |
 | `infer_setting.trunk_pairmixer_transition_chunk_size`, `infer_setting.trunk_pairformer_transition_chunk_size` | pair transitions in the trunk | 128 |
 | `infer_setting.confidence_pair_transition_chunk_size` | pair transitions in the confidence head | 128 |
-| `infer_setting.sample_diffusion_chunk_size` | diffusion samples per batch | 1 |
+| `infer_setting.sample_diffusion_chunk_size` | diffusion samples per chunk | 5 |
+| `infer_setting.confidence_sample_chunk_size` | confidence samples per chunk | 5 (1 above 2,000 tokens) |
 | `infer_setting.diffusion_conditioning_row_chunk_size` | pair-conditioning rows | 768 |
 | `infer_setting.lddt_metrics_chunk_size` | metric computation | 1 |
 | `diffusion_cache_mode` | what the diffusion module reuses across steps | `full` |
-| `infer_setting.atom_block_cache` | fixed atom-block conditioning in input batching | on |
+| `infer_setting.atom_block_cache` | fixed atom-block conditioning in single-design and batched inference | on |
 | `infer_setting.compile_diffusion` | optional compiled token diffusion on CUDA; independent of replay | off |
 | `infer_setting.cuda_graphs` | replay eager token kernels by default, retaining graph/input buffers | on |
 | `infer_setting.cuda_graph_max_cache_size` | maximum retained graph signatures; extra shapes run without replay | 2 |
@@ -77,13 +78,10 @@ Compilation can change coordinates; see the
 [current defaults and numerical validation](inference_optimization_summary.md#current-inference-defaults).
 The older memory measurements above predate compilation and replay support.
 
-`infer_setting.sample_diffusion_chunk_size` is 1, so the diffusion module
-denoises the samples one at a time and its memory does not grow with the
-sample count. When an input fits with room to spare, set it to the sample count
-(`--infer_setting.sample_diffusion_chunk_size 5` with the default five samples)
-to denoise them together, which is faster: on 9fm7 (644 tokens), the forward
-pass took 43 s instead of 62 s at the same peak memory. Go back to 1 if the
-input no longer fits.
+Ordinary inference denoises up to five samples together. On 9fm7 (644 tokens),
+the forward pass took 43 s with diffusion chunk five and 62 s with chunk one.
+For memory-constrained inputs, set both sample chunks to one. This retains
+the requested sample count but can change seeded predictions.
 
 The four stage-specific transition chunks are independent of the global
 attention chunk. They are `ValueMaybeNone`: `None` inherits the effective pair
@@ -127,7 +125,7 @@ bash inference_demo.sh --infer_setting.chunk_size 512
 
 ## Large inputs
 
-The defaults fit inputs up to about 1,500 tokens on a 95 GiB GPU. Larger ones
+Earlier measurements with one sample at a time fit inputs up to about 1,500 tokens on a 95 GiB GPU. Larger ones
 need smaller chunks, the PyTorch triangle multiplication, whose update runs
 chunked and in place where the cuEquivariance and FlashPairformer kernels have
 no such path, and PyTorch's expandable memory segments. With these settings,
@@ -138,6 +136,9 @@ the two largest FoldBench inputs, of 2,456 and 2,532 tokens, complete on a
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 mol pred -i input.json -o ./output \
   --trimul_kernel torch \
+  --infer_setting.sample_diffusion_chunk_size 1 \
+  --infer_setting.confidence_sample_chunk_size 1 \
+  --infer_setting.atom_block_cache false --infer_setting.cuda_graphs false \
   --infer_setting.chunk_size 256 \
   --model.msa_module.msa_chunk_size 512 \
   --infer_setting.msa_pair_transition_chunk_size 256 \

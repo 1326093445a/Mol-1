@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prediction runs without MC dropout or TF32 and one diffusion sample at a
-time; evaluation during training keeps its own settings."""
+"""Inference profiles exposed through the CLI and Python runner."""
 
 import tempfile
 import unittest
@@ -25,7 +24,7 @@ from click.testing import CliRunner
 from mol.config.base import configs as configs_base
 from mol.config.inference import inference_configs
 from mol.config.parser import parse_configs
-from mol.runner import batch_inference
+from mol.runner import batch_inference, inference
 
 
 def parsed(configs):
@@ -50,7 +49,12 @@ class InferenceDefaultsTest(unittest.TestCase):
         self.assertEqual(configs.infer_setting.cpu_thread_limit, 4)
         self.assertEqual(configs.infer_setting.prefetch_inputs, 0)
         self.assertFalse(configs.infer_setting.background_write)
-        self.assertEqual(configs.infer_setting.sample_diffusion_chunk_size, 1)
+        self.assertEqual(configs.batch_size, 1)
+        self.assertEqual(configs.sample_diffusion.N_sample, 5)
+        self.assertEqual(configs.triangle_multiplicative, "auto")
+        self.assertEqual(configs.triangle_attention, "auto")
+        self.assertEqual(configs.infer_setting.sample_diffusion_chunk_size, 5)
+        self.assertEqual(configs.infer_setting.confidence_sample_chunk_size, 5)
         # The rest of infer_setting is the shared one.
         self.assertEqual(
             configs.infer_setting.chunk_size,
@@ -66,6 +70,35 @@ class InferenceDefaultsTest(unittest.TestCase):
                 )
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertFalse(run.call_args.kwargs["enable_tf32"])
+        self.assertEqual(run.call_args.kwargs["batch_size"], 1)
+        self.assertEqual(run.call_args.kwargs["trimul_kernel"], "auto")
+        self.assertEqual(run.call_args.kwargs["triatt_kernel"], "auto")
+
+    def test_screening_keeps_one_sample_chunks_and_validates_overrides(self):
+        settings = {"infer_setting.early_stop_ipsae_threshold": .05}
+        with patch.object(batch_inference, "download_inference_cache"), \
+             patch.object(batch_inference, "InferenceRunner", side_effect=lambda cfg: cfg):
+            cfg = batch_inference.get_default_runner(memory_settings=settings)
+            self.assertEqual(cfg.infer_setting.sample_diffusion_chunk_size, 1)
+            self.assertEqual(cfg.infer_setting.confidence_sample_chunk_size, 1)
+            settings["infer_setting.confidence_sample_chunk_size"] = 5
+            with self.assertRaisesRegex(ValueError, "confidence_sample_chunk_size"):
+                batch_inference.get_default_runner(memory_settings=settings)
+
+    def test_raw_cli_respects_screening_and_explicit_chunks(self):
+        with (
+            patch.object(inference, "parse_sys_args") as args,
+            patch.object(inference, "download_inference_cache"),
+            patch.object(inference, "main") as main,
+        ):
+            args.return_value = "--infer_setting.early_stop_ipsae_threshold 0.05"
+            inference.run()
+            settings = main.call_args.args[0].infer_setting
+            self.assertEqual(settings.sample_diffusion_chunk_size, 1)
+            self.assertEqual(settings.confidence_sample_chunk_size, 1)
+            args.return_value += " --infer_setting.sample_diffusion_chunk_size 5"
+            with self.assertRaisesRegex(ValueError, "sample_diffusion_chunk_size"):
+                inference.run()
 
     def test_training_evaluation_is_unchanged(self):
         configs = parsed(dict(configs_base))

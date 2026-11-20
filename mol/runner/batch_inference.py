@@ -37,6 +37,7 @@ from Bio import SeqIO
 from mol.config.base import configs as configs_base
 from mol.config.data import data_configs
 from mol.config.inference import (
+    apply_screening_chunk_defaults,
     inference_configs,
     validate_context_parallel,
     validate_input_batching,
@@ -297,7 +298,7 @@ def memory_options(command: Any) -> Any:
         (
             "infer_setting.atom_block_cache",
             bool,
-            "Cache fixed atom-block conditioning during input batching (default true).",
+            "Cache fixed atom-block conditioning during single-design and batched inference (default true).",
         ),
         (
             "infer_setting.batch_max_padding_ratio",
@@ -465,6 +466,7 @@ def get_default_runner(
     configs.batch_size = batch_size
     configs.context_parallel_size = context_parallel_size
     apply_memory_settings(configs, memory_settings or {})
+    apply_screening_chunk_defaults(configs, memory_settings or {})
     validate_input_batching(configs)
     validate_context_parallel(configs)
     if context_parallel_size > 1:
@@ -761,8 +763,8 @@ def mol_cli() -> None:
     default="auto",
     help=(
         "Triangle multiplicative update kernel ('auto', 'cuequivariance', "
-        "'torch', 'flashpairformer'). 'auto' picks cuequivariance on CUDA when "
-        "it is importable and torch otherwise; it never picks flashpairformer."
+        "'torch', 'flashpairformer'). 'auto' prefers FlashPairformer on CUDA "
+        "when installed with cuEquivariance, then cuEquivariance, then torch."
     ),
 )
 @click.option(

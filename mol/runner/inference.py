@@ -21,6 +21,7 @@
 import json
 import logging
 import os
+import shlex
 import time
 import traceback
 import urllib.request
@@ -38,6 +39,7 @@ from biotite.structure import AtomArray
 from mol.config.base import configs as configs_base
 from mol.config.data import data_configs
 from mol.config.inference import (
+    apply_screening_chunk_defaults,
     inference_configs,
     validate_context_parallel,
     validate_input_batching,
@@ -812,6 +814,8 @@ def _failure_hint(error: BaseException) -> str:
             "Hint: this system did not fit in device memory. Peak memory grows "
             "roughly with the square of the token count. Lower "
             "--infer_setting.chunk_size and --model.msa_module.msa_chunk_size, "
+            "set --infer_setting.sample_diffusion_chunk_size 1 and "
+            "--infer_setting.confidence_sample_chunk_size 1, "
             "or use fewer samples "
             "(--sample in mol pred, --sample_diffusion.N_sample otherwise). "
             "Disable retained replay buffers with --infer_setting.cuda_graphs false "
@@ -1109,6 +1113,8 @@ def run() -> None:
         arg_str=arg_str,
         fill_required_with_null=True,
     )
+    explicit_options = {key.removeprefix("--") for key in shlex.split(arg_str)[::2]}
+    apply_screening_chunk_defaults(configs, explicit_options)
     logger.info(
         f"Using params for model {model_name}: "
         f"cycle={configs.model.N_cycle}, step={configs.sample_diffusion.N_step}"

@@ -406,6 +406,20 @@ class DiffusionModule(nn.Module):
             )
         return self.diffusion_transformer.prepare_pair_biases(z)
 
+    def prepare_atom_caches(self, atom_to_token_idx, s, p_lm, c_l, *, inplace_safe, cache_blocks):
+        """Build the atom conditioning shared across this request's denoising calls."""
+        pair, single = self.atom_attention_encoder.prepare_conditioned_cache(
+            atom_to_token_idx, s.unsqueeze(-3), p_lm, c_l, inplace_safe=inplace_safe
+        )
+        cache = {"conditioned_atom": (pair, single)}
+        if cache_blocks:
+            for name, module in (
+                ("atom_encoder_blocks", self.atom_attention_encoder),
+                ("atom_decoder_blocks", self.atom_attention_decoder),
+            ):
+                cache[name] = module.atom_transformer.prepare_inference_cache(single, pair)
+        return cache
+
     def f_forward(
         self,
         r_noisy: torch.Tensor,
@@ -422,6 +436,7 @@ class DiffusionModule(nn.Module):
         use_conditioning: bool = True,
         enable_efficient_fusion: bool = False,
         projected_pair_biases: Optional[ProjectedPairBiases] = None,
+        atom_cache: Optional[dict] = None,
     ) -> torch.Tensor:
         """The raw network to be trained.
         As in EDM equation (7), this is F_theta(c_in * x, c_noise(sigma)).
@@ -537,6 +552,8 @@ class DiffusionModule(nn.Module):
                 c_l=c_l,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
+                conditioned_cache=atom_cache["conditioned_atom"] if atom_cache else None,
+                atom_transformer_cache=atom_cache.get("atom_encoder_blocks") if atom_cache else None,
             )
         # Upcast
         a_token = a_token.to(dtype=torch.float32)
@@ -598,6 +615,7 @@ class DiffusionModule(nn.Module):
                 p_skip=p_skip,
                 inplace_safe=inplace_safe,
                 chunk_size=chunk_size,
+                atom_transformer_cache=atom_cache.get("atom_decoder_blocks") if atom_cache else None,
             )
 
         return r_update
@@ -618,6 +636,7 @@ class DiffusionModule(nn.Module):
         use_conditioning: bool = True,
         enable_efficient_fusion: bool = False,
         projected_pair_biases: Optional[ProjectedPairBiases] = None,
+        atom_cache: Optional[dict] = None,
     ) -> torch.Tensor:
         """One step denoise: x_noisy, noise_level -> x_denoised
 
@@ -678,6 +697,7 @@ class DiffusionModule(nn.Module):
             use_conditioning=use_conditioning,
             enable_efficient_fusion=enable_efficient_fusion,
             projected_pair_biases=projected_pair_biases,
+            atom_cache=atom_cache,
         )
 
         # Rescale updates to positions and combine with input positions

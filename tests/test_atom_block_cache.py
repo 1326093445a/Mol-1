@@ -12,6 +12,34 @@ from mol.model.mol import Mol
 from tests.test_input_batching import activate_residuals, tiny_config, tiny_features
 
 
+@pytest.mark.parametrize("mode", ["full", "shared", "off"])
+def test_singleton_five_sample_cache_matches_uncached(mode):
+    torch.manual_seed(23)
+    cfg = tiny_config()
+    cfg.diffusion_cache_mode = mode
+    cfg.sample_diffusion.N_sample = 5
+    cfg.infer_setting.sample_diffusion_chunk_size = 5
+    cfg.infer_setting.confidence_sample_chunk_size = 5
+    model = Mol(cfg).eval()
+    activate_residuals(model)
+    features = tiny_features(6, 101)
+
+    def predict():
+        torch.manual_seed(101)
+        return model(copy.deepcopy(features), None, None, mode="inference")[0]
+
+    with torch.no_grad():
+        cfg.infer_setting.atom_block_cache = False
+        reference = predict()
+        cfg.infer_setting.atom_block_cache = True
+        with patch.object(AtomTransformer, "prepare_inference_cache", autospec=True,
+                          side_effect=AtomTransformer.prepare_inference_cache) as prepare:
+            result = predict()
+        assert prepare.call_count == (0 if mode == "off" else 2)
+    for key in ("coordinate", "pae", "pde", "plddt", "resolved", "contact_probs"):
+        assert torch.equal(result[key], reference[key]), key
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("chunk", [None, 3])
 def test_atom_cache_is_exact_and_immutable(device, chunk):

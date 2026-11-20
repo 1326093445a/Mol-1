@@ -83,7 +83,8 @@ Mol-1 environment
   - cuequivariance_ops_torch: 0.10.0
   - triton: 3.7.0
 - device=auto resolves to: cuda:0
-- triangle_*=auto resolves to: cuequivariance
+- triangle_multiplicative=auto resolves to: flashpairformer
+- triangle_attention=auto resolves to: cuequivariance
 - Preprocessing binaries (MSA and templates):
   - hmmsearch: /usr/bin/hmmsearch
   - hmmbuild: /usr/bin/hmmbuild

@@ -80,6 +80,14 @@ The easiest way to run Mol-1 prediction is:
 mol pred -i /path/to/input/json -o /path/to/output/dir
 ```
 
+By default this runs **one design at a time, five diffusion samples together**,
+with protein MSAs enabled and templates opt-in. Diffusion and confidence sample
+chunks both default to five. Above 2,000 tokens the confidence head scores one
+sample at a time. CUDA inference prefers fused LayerNorm, FlashPairformer
+multiplication and cuEquivariance attention when installed. Changing diffusion
+chunk size can change seeded coordinates and scores. To reproduce a previous
+configuration, set both chunk sizes and both triangle kernels explicitly.
+
 **Startup and model reuse.** Strict checkpoint loading skips redundant SciPy
 weight initialization by default (`--infer_setting.fast_init false` disables
 this). CUDA inference caps PyTorch CPU threads at four; set
@@ -99,7 +107,7 @@ Compilation remains off by default and can change predictions even with fused
 LayerNorm retained: the 8cnh compilation test measured a 2.407 Å maximum
 coordinate-component change. Opt in separately with
 `--infer_setting.compile_diffusion true`. Input batching keeps
-atom-block caching enabled by default. Keep LayerNorm, grouping, batch size and
+atom-block caching enabled by default, as does single-design inference. Keep LayerNorm, grouping, batch size and
 execution mode fixed across scores compared in one pool. See
 [defaults and validation](docs/inference_optimization_summary.md#current-inference-defaults)
 for controls, measurements and API resource management.
@@ -108,7 +116,8 @@ for controls, measurements and API resource management.
 `--infer_setting.early_stop_ipsae_threshold 0.05` to finish and score the first
 generated sample, then skip remaining samples if its `ipsae_min_10` is zero or
 below 0.05. This is off by default and requires diffusion/confidence sample
-chunks of one. With multiple inputs, **every input in the batch must fail**;
+chunks of one. The CLI selects one for each unspecified sample chunk when
+screening is enabled. With multiple inputs, **every input in the batch must fail**;
 mixed batches finish all samples without shrinking or repacking. Undefined
 ipSAE never triggers stopping. A later sample can have a better score, so this
 heuristic trades sampling coverage for compute. See
@@ -133,9 +142,7 @@ without MSA, put them in one JSON job list and use `--use_msa false --batch_size
 Add `--sample 1` for one predicted structure per input, or keep the default five
 samples per input. See [input batching](docs/inference_batching.md) for supported
 settings, memory controls and multiple GPUs.
-The batched CUDA path supports cuEquivariance and explicit TMK3. To process all
-five samples together, set `--infer_setting.sample_diffusion_chunk_size 5`;
-`--infer_setting.confidence_sample_chunk_size 5` also batches their scoring.
+Both sample chunks also default to five on the batched CUDA path.
 
 **One complex across GPUs.** Launch with `torchrun` and
 `--context_parallel_size P --use_msa false` to distribute one prediction's
@@ -265,12 +272,10 @@ Peak device memory grows close to quadratically with token count and depends
 on the GPU. [docs/inference_memory.md](docs/inference_memory.md) has measured
 points, how to fit a curve for your own card from the token count and peak
 that every prediction logs, and every chunking control. When a system does not
-fit, the error names the settings to turn. When it fits with room to spare,
-`--infer_setting.sample_diffusion_chunk_size 5` denoises the five samples
-together instead of one at a time, which is faster.
+fit, setting both sample chunks to one reduces concurrent sample work.
 
-**Large inputs.** The defaults fit inputs of up to about 1,500 tokens on a
-95 GiB GPU. Larger ones, such as the biggest systems in FoldBench, need the
+**Large inputs.** Earlier measurements with one sample at a time fit inputs of up to about
+1,500 tokens on a 95 GiB GPU. Larger ones, such as the biggest systems in FoldBench, need the
 [large-input settings](docs/inference_memory.md#large-inputs): smaller chunks,
 the PyTorch triangle multiplication and expandable allocator segments. To
 predict all of FoldBench, run its inputs above 1,500 tokens with them:
@@ -278,6 +283,8 @@ predict all of FoldBench, run its inputs above 1,500 tokens with them:
 ```bash
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 mol pred -i input.json -o ./output --trimul_kernel torch \
+  --infer_setting.sample_diffusion_chunk_size 1 --infer_setting.confidence_sample_chunk_size 1 \
+  --infer_setting.atom_block_cache false --infer_setting.cuda_graphs false \
   --infer_setting.chunk_size 256 --model.msa_module.msa_chunk_size 512 \
   --infer_setting.msa_pair_transition_chunk_size 256 \
   --infer_setting.trunk_pairmixer_transition_chunk_size 32 \

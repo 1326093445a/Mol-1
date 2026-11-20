@@ -18,10 +18,11 @@ identical across them.
 | Any GPU | never `--triatt_kernel torch`: it is slower and runs out of memory from about 1,000 tokens |
 | Fine-tuning | the defaults; `flashpairformer` is inference only |
 
-`mol pred` defaults both triangle operations to `auto`, which resolves to
-cuEquivariance on CUDA when its operator wheels import and to PyTorch
-otherwise. `mol doctor` prints what `auto` resolves to on the machine it runs
-on.
+`mol pred` defaults both triangle operations to `auto`. On CUDA, inference
+prefers FlashPairformer multiplication when both opt_core and cuEquivariance
+are available, and cuEquivariance attention. Without opt_core, multiplication
+uses cuEquivariance. Without cuEquivariance, both use PyTorch. `mol doctor`
+reports the two choices separately.
 
 Independent-input batches (`--batch_size > 1`) support cuEquivariance triangle
 operations and explicit FlashPairformer multiplication. `auto` resolves as it
@@ -42,7 +43,7 @@ time and the PyTorch peak memory.
 
 | `--trimul_kernel` / `--triatt_kernel` | 8cnh, 509 tokens | 8j2w, 1,000 tokens | 8h0q, 1,499 tokens |
 | --- | --- | --- | --- |
-| `cuequivariance` / `cuequivariance` (default) | 44 s, 9.3 GiB | 109 s, 28.1 GiB | 259 s, 56.0 GiB |
+| `cuequivariance` / `cuequivariance` (benchmark baseline) | 44 s, 9.3 GiB | 109 s, 28.1 GiB | 259 s, 56.0 GiB |
 | `cuequivariance` / `triattention` | 43 s, 9.3 GiB | 107 s, 27.9 GiB | 248 s, 56.0 GiB |
 | `flashpairformer` / `cuequivariance` | 39 s, 9.5 GiB | 89 s, 28.3 GiB | 211 s, 56.3 GiB |
 | `flashpairformer` / `triattention` | 39 s, 9.5 GiB | 87 s, 28.2 GiB | 201 s, 56.3 GiB |
@@ -50,7 +51,7 @@ time and the PyTorch peak memory.
 | `torch` / `triattention` | 45 s, 9.3 GiB | 114 s, 27.9 GiB | 268 s, 51.6 GiB |
 | any / `torch` | 59–66 s, 21.3–21.5 GiB | out of memory | out of memory |
 
-- FlashPairformer is the backend that pays: 12–19% faster than the default on
+- FlashPairformer multiplication was 12–19% faster than the benchmark baseline on
   its own and 11–22% with `triattention`, more so the larger the input, at the
   same memory. `triattention` alone adds nothing at 509 tokens and 4–5% at
   1,499.
@@ -61,21 +62,18 @@ time and the PyTorch peak memory.
   7yvb (2,532 tokens) in 1,568 s at 87.1 GiB.
 - The PyTorch triangle attention is 40–50% slower already at 509 tokens and
   runs out of memory at 1,000.
-- TF32 is off by default. Without it, the default combination is 4–8% slower
+- TF32 is off by default. Without it, the benchmark baseline is 4–8% slower
   at the same memory; `--enable_tf32 true` buys that back, with slightly
   different results.
 
 ## Selecting a backend
 
-| Setting | `mol pred` option | Values | Config default |
+| Setting | `mol pred` option | Values | Inference default |
 | --- | --- | --- | --- |
-| `triangle_multiplicative` | `--trimul_kernel` | `auto`, `cuequivariance`, `flashpairformer`, `torch` | `cuequivariance` |
-| `triangle_attention` | `--triatt_kernel` | `auto`, `cuequivariance`, `triattention`, `torch` | `cuequivariance` |
+| `triangle_multiplicative` | `--trimul_kernel` | `auto`, `cuequivariance`, `flashpairformer`, `torch` | `auto` |
+| `triangle_attention` | `--triatt_kernel` | `auto`, `cuequivariance`, `triattention`, `torch` | `auto` |
 
-The config defaults in [mol/config/base.py](../mol/config/base.py) are what
-`inference_demo.sh`, `finetune_demo.sh` and `mol/runner/train.py` use;
-`mol pred` defaults to `auto` instead, because it is also the entry point on
-machines without a GPU.
+Training uses the cuEquivariance defaults in [the base config](../mol/config/base.py).
 
 ```bash
 mol pred -i input.json -o ./output --trimul_kernel flashpairformer --triatt_kernel triattention
@@ -83,8 +81,7 @@ bash inference_demo.sh --triangle_multiplicative torch --triangle_attention tria
 TRIANGLE_MULTIPLICATIVE=flashpairformer bash inference_demo.sh
 ```
 
-`auto` never picks `flashpairformer`, which has to be installed on purpose. A
-requested backend that cannot be used is an error, not a downgrade. Two
+Explicitly requesting FlashPairformer requires its optional package. Two
 substitutions are made by design: on compute capability 7.x both operations
 run on PyTorch in FP32, and the log says so; and `flashpairformer` hands the
 calls it cannot take to cuEquivariance, as described below.

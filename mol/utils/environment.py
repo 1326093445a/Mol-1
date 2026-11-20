@@ -194,8 +194,9 @@ def format_doctor_report() -> str:
             lines.append(f"- device=auto resolves to: {device}")
             from mol.model.triangular.layers import resolve_auto_kernel
 
-            kernel = resolve_auto_kernel("triangle_attention", device)
-            lines.append(f"- triangle_*=auto resolves to: {kernel}")
+            for setting in ("triangle_multiplicative", "triangle_attention"):
+                kernel = resolve_auto_kernel(setting, device)
+                lines.append(f"- {setting}=auto resolves to: {kernel}")
         except Exception as error:
             lines.append(f"- auto resolution failed: {_exception(error)}")
 

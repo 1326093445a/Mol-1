@@ -153,18 +153,29 @@ settings, memory, timing, sample counts and replay counters for every arm.
 
 ## Current inference defaults
 
-As of 2026-11-13, ordinary CUDA prediction uses the following settings:
+As of 2026-11-20, ordinary CUDA prediction uses these settings.
 
 | Setting | Default | Behavior |
 | --- | --- | --- |
+| `batch_size` | `1` | One design per forward. Protein MSA and optional templates are supported. |
+| `LAYERNORM_TYPE` | `fast_layernorm` | Fused CUDA LayerNorm. |
+| Triangle multiplication / attention | `auto` / `auto` | Prefer FlashPairformer multiplication and cuEquivariance attention when available. |
+| Diffusion / confidence sample chunks | `5` / `5` | The default five samples run together. Screening uses chunks of one. Confidence uses one above 2,000 tokens. |
 | `infer_setting.fast_init` | `true` | Skip redundant SciPy initialization before a strict, complete checkpoint load. |
 | `infer_setting.cpu_thread_limit` | `4` | Cap PyTorch intra-op and not-yet-initialized inter-op CPU pools for CUDA inference; preserve lower limits. Zero leaves process settings alone. |
-| `infer_setting.atom_block_cache` | `true` | Reuse fixed atom-block conditioning in input batching with full/shared diffusion caching. |
+| `infer_setting.atom_block_cache` | `true` | Reuse fixed atom-block conditioning in single-design and batched prediction with full/shared diffusion caching. |
 | `infer_setting.compile_diffusion` | `false` | Opt-in token diffusion compilation with Inductor; independent of replay. |
 | `infer_setting.cuda_graphs` | `true` | Replay the eager token stack on CUDA; uses compiled kernels only if compilation is separately enabled. |
 | `infer_setting.cuda_graph_max_cache_size` | `2` | Bound retained graph pools; additional signatures run without replay. |
 | `infer_setting.compile_dynamic_shapes` | `true` | Compile for varying token lengths; captured graphs still use exact shapes without added padding. |
 | `infer_setting.compile_threads` | `1` | Bound Inductor compilation threads. |
+
+The 7r6r checkpoint smoke test used one design with a 703-row protein MSA,
+five samples, two recycles and four diffusion steps on an H200. Automatic
+kernel selection served TMK3 calls with fused LayerNorm and eager replay.
+Coordinates, confidence tensors and rankings matched an explicitly configured
+five-sample run with the singleton atom-block cache disabled, bit for bit.
+The 3.5% cache timing below was measured on a two-input batch.
 
 **Compilation can change predictions and remains experimental.** No production
 speedup has been established. The fused-LayerNorm 8cnh experiment
@@ -175,9 +186,8 @@ the runner does not switch fused LayerNorm to the PyTorch implementation.
 
 CPU, MPS, context-parallel inference and training retain their eager compute
 paths. Fast initialization applies to strict inference loading on all devices;
-partial loading requires `fast_init=false`. Sampling counts, sample chunk sizes,
-precision, padding controls, MSA/template settings and kernel selection keep
-their existing defaults. Prefetch and background writing remain optional.
+partial loading requires `fast_init=false`. Pin chunk sizes and kernels when
+comparing seeded predictions. Prefetch and background writing remain optional.
 
 The CUDA runner lazily installs one execution context after successful checkpoint
 loading and reuses it across predictions and input JSONs. It reports compilation,

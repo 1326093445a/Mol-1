@@ -3,6 +3,7 @@
 """Real collectives: one complex partitioned across two and three CPU workers."""
 
 import copy
+import math
 import os
 from datetime import timedelta
 from types import SimpleNamespace
@@ -161,10 +162,11 @@ def _worker(rank, size, rendezvous):
                     torch.testing.assert_close(
                         observed[key], expected[key], atol=3e-4, rtol=3e-4
                     )
-                assert (
-                    ctx.stats["pairformer_calls"]
-                    >= 2 + config.sample_diffusion.N_sample
+                confidence_chunks = math.ceil(
+                    config.sample_diffusion.N_sample
+                    / config.infer_setting.confidence_sample_chunk_size
                 )
+                assert ctx.stats["pairformer_calls"] >= config.model.N_cycle + confidence_chunks
                 assert ctx.stats["diffusion_calls"] == 8  # 4 steps x 2 sample chunks
                 assert ctx.stats["last_diffusion_queries"] == (5 + size - 1) // size
 

@@ -25,6 +25,7 @@ import math
 import os
 import sys
 from collections import Counter
+from functools import lru_cache
 
 import torch
 
@@ -53,6 +54,15 @@ def _import_trimul():
             sys.path.append(source_root)
         importlib.invalidate_caches()
         return importlib.import_module("opt_core.kernels.trimul")
+
+
+@lru_cache(maxsize=1)
+def flashpairformer_is_available() -> bool:
+    try:
+        _import_trimul()
+    except (ImportError, OSError):
+        return False
+    return True
 
 
 def clear_flashpairformer_cache(model):

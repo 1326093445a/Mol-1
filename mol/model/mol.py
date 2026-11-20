@@ -22,6 +22,7 @@
 import copy
 import random
 import time
+from functools import partial
 from typing import Any, Optional
 
 import numpy as np
@@ -180,7 +181,7 @@ class Mol(nn.Module):
                 f"choose from {allowed}. FlashPairformer TMK3 supports inference only."
             )
         if backend == "auto":
-            return resolve_auto_kernel("triangle_multiplicative", self._device())
+            return resolve_auto_kernel("triangle_multiplicative", self._device(), training=self.training)
         return backend
 
     def _triangle_attention_backend(self) -> str:
@@ -756,6 +757,26 @@ class Mol(nn.Module):
         cache["projected_pair_biases"] = self._prepare_projected_pair_biases(
             cache["pair_z"]
         )
+        denoise_net = self.diffusion_module
+        if (
+            mode == "inference"
+            and not self.training
+            and not torch.is_grad_enabled()
+            and self.configs.get("context_parallel_size", 1) == 1
+            and self.configs.infer_setting.get("atom_block_cache", False)
+            and cache["pair_z"] is not None
+        ):
+            # Match the sampler's precision, including the input casts in FP32 mode.
+            prepare_atoms = autocasting_disable_decorator(self.configs.skip_amp.sample_diffusion)(
+                self.diffusion_module.prepare_atom_caches
+            )
+            denoise_net = partial(
+                denoise_net,
+                atom_cache=prepare_atoms(
+                    input_feature_dict["atom_to_token_idx"], s, *cache["p_lm/c_l"],
+                    inplace_safe=inplace_safe, cache_blocks=True,
+                ),
+            )
         from mol.model.early_stopping import make_first_sample_gate
 
         gate = make_first_sample_gate(
@@ -763,7 +784,7 @@ class Mol(nn.Module):
             inplace_safe=inplace_safe,
         ) if mode == "inference" and label_dict is None else None
         pred_dict["coordinate"] = self.sample_diffusion(
-            denoise_net=self.diffusion_module,
+            denoise_net=denoise_net,
             input_feature_dict=input_feature_dict,
             s_inputs=s_inputs,
             s_trunk=s,
@@ -783,6 +804,7 @@ class Mol(nn.Module):
         del cache["projected_pair_biases"]
         del cache["pair_z"]
         del cache["p_lm/c_l"]
+        del denoise_net
 
         step_diffusion = time.time()
         time_tracker.update({"diffusion": step_diffusion - step_trunk})

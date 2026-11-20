@@ -397,23 +397,10 @@ def prepare_sample_states(model, states, schedules):
                     s_input, s
                 )
             )
-            local_cache["conditioned_atom"] = (
-                model.diffusion_module.atom_attention_encoder.prepare_conditioned_cache(
-                    feat["atom_to_token_idx"],
-                    s.unsqueeze(-3),
-                    *local_cache["p_lm/c_l"],
-                    inplace_safe=True,
-                )
-            )
-            if cfg.infer_setting.get("atom_block_cache", False):
-                atom_pair, atom_single = local_cache["conditioned_atom"]
-                for name, module in (
-                    ("atom_encoder_blocks", model.diffusion_module.atom_attention_encoder),
-                    ("atom_decoder_blocks", model.diffusion_module.atom_attention_decoder),
-                ):
-                    local_cache[name] = module.atom_transformer.prepare_inference_cache(
-                        atom_single, atom_pair
-                    )
+            local_cache.update(model.diffusion_module.prepare_atom_caches(
+                feat["atom_to_token_idx"], s, *local_cache["p_lm/c_l"],
+                inplace_safe=True, cache_blocks=cfg.infer_setting.get("atom_block_cache", False),
+            ))
     return sample_states, sample_schedules
 
 

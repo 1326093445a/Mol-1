@@ -123,6 +123,19 @@ class TestDeviceSelection(unittest.TestCase):
 
 
 class TestAutoKernel(unittest.TestCase):
+    def test_inference_prefers_flash_multiplication_only_when_available(self):
+        from mol.model.triangular import layers
+
+        device = torch.device("cuda")
+        with patch.object(layers, "cuequivariance_is_available", return_value=True), patch(
+            "mol.model.triangular.flashpairformer.flashpairformer_is_available", return_value=True
+        ) as flash:
+            self.assertEqual(layers.resolve_auto_kernel("triangle_multiplicative", device), "flashpairformer")
+            self.assertEqual(layers.resolve_auto_kernel("triangle_attention", device), "cuequivariance")
+            self.assertEqual(layers.resolve_auto_kernel("triangle_multiplicative", device, training=True), "cuequivariance")
+            flash.return_value = False
+            self.assertEqual(layers.resolve_auto_kernel("triangle_multiplicative", device), "cuequivariance")
+
     def test_non_cuda_devices_use_the_torch_path(self):
         from mol.model.triangular.layers import resolve_auto_kernel
 

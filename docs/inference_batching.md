@@ -140,8 +140,8 @@ Batching requires:
 - `--use_msa false`, `--use_template false`, and `--use_rna_msa false`.
 - Triangle multiplication: `auto`, `torch`, `cuequivariance`, or
   `flashpairformer`; triangle attention: `auto`, `torch`, or `cuequivariance`.
-  On CUDA, `auto` uses cuEquivariance when installed. TMK3 requires an explicit
-  `--trimul_kernel flashpairformer`; its per-input kernels reuse packed weights
+  On CUDA, `auto` prefers TMK3 multiplication with cuEquivariance attention
+  when installed. The per-input TMK3 kernels reuse packed weights
   inside the batch. `triattention` is not supported for independent batches.
 - CPU or CUDA, `num_workers=0`, no Monte Carlo dropout, and
   `model.N_model_seed=1`. The CLI's defaults meet these conditions except MSA.
@@ -166,8 +166,8 @@ This still produces five structures per input. Sample chunks change the number
 processed concurrently, not the number of samples, recycles or diffusion steps.
 Diffusion chunk size changes RNG draw ordering, so changing it does not preserve
 the exact coordinates for a seed. For comparisons of implementation numerics,
-hold the chunk size and kernels fixed. Both chunk defaults remain one to limit
-memory use. Confidence chunks automatically stay at one above 2,000 tokens,
+hold the chunk size and kernels fixed. Both chunk defaults are five in ordinary
+prediction and one with first-sample screening. Confidence chunks stay at one above 2,000 tokens,
 preserving the existing CPU offload policy for large confidence matrices.
 
 The batched implementation reuses trunk padding buffers and masks between
@@ -521,8 +521,7 @@ with `--infer_setting.atom_block_cache true` and the existing `full` or `shared`
 diffusion-cache modes; its default is now **true**, and `off` retains the
 uncached path. Gradient-enabled execution and training ignore the cache.
 
-This change currently applies to `predict_batch`, including a partial batch of
-one input. The ordinary singleton prediction path is unchanged. Fixed local
+This cache serves both `predict_batch` and ordinary single-design prediction. Fixed local
 attention masks are still rebuilt; this optimization caches projections and
 conditioning, not those masks.
 

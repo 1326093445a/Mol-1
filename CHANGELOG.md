@@ -4,6 +4,13 @@
 
 ### Prediction compatibility
 
+- **Single-design inference defaults to chunks of five for diffusion and
+  confidence.** CUDA inference with `auto` prefers FlashPairformer (TMK3)
+  multiplication and cuEquivariance attention when available. The existing
+  atom-block cache now also serves ordinary single-design inference. Changing
+  the diffusion chunk can change seeded coordinates and scores. Pin the
+  previous chunks (both one) and kernel settings for historical comparisons.
+  First-sample screening selects one for unspecified sample chunks.
 - **Experimental fixed-slot batch refill (off by default).**
   `--infer_setting.batch_refill true`, together with an explicit first-sample
   ipSAE cutoff, replaces stopped or completed jobs between diffusion samples.

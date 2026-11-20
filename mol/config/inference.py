@@ -40,6 +40,8 @@ inference_configs = {
     "load_checkpoint_dir": os.path.join(MOL_ROOT_DIR, "checkpoint"),
     "num_workers": 0,
     "batch_size": 1,  # independent complexes per forward, separate from N_sample
+    "triangle_multiplicative": "auto",
+    "triangle_attention": "auto",
     "context_parallel_size": 1,  # GPUs cooperating on the same complex
     "use_msa": True,
     # FP32 matrix multiplications stay FP32; true runs them on TF32 tensor
@@ -53,7 +55,7 @@ inference_configs = {
     "use_rna_msa": False,
     "use_seeds_in_json": False,
     # Where prediction differs from evaluation during training: no Monte Carlo
-    # dropout in the recycles, and one diffusion sample at a time.
+    # dropout in the recycles.
     "mc_dropout_apply_rate": 0.0,
     "mc_dropout_rate": 0.0,
     "infer_setting": {
@@ -68,8 +70,8 @@ inference_configs = {
         "compile_dynamic_shapes": True,
         "compile_threads": 1,
         "cpu_thread_limit": 4,  # CUDA host threads; 0 leaves process settings alone.
-        "sample_diffusion_chunk_size": ValueMaybeNone(1),
-        "confidence_sample_chunk_size": ValueMaybeNone(1),
+        "sample_diffusion_chunk_size": ValueMaybeNone(5),
+        "confidence_sample_chunk_size": ValueMaybeNone(5),
         "early_stop_ipsae_threshold": DefaultNoneWithType(float),
         "batch_refill": False,  # Experimental fixed-slot first-sample screening.
         "atom_block_cache": True,
@@ -80,6 +82,15 @@ inference_configs = {
         "batch_max_pair_tokens": 0,
     },
 }
+
+
+def apply_screening_chunk_defaults(configs, explicit_options):
+    """Score the first sample before generating others when screening is requested."""
+    settings = configs.infer_setting
+    if settings.get("early_stop_ipsae_threshold") is not None and configs.sample_diffusion.N_sample > 1:
+        for key in ("sample_diffusion_chunk_size", "confidence_sample_chunk_size"):
+            if f"infer_setting.{key}" not in explicit_options:
+                settings[key] = 1
 
 
 def validate_inference_acceleration(configs):

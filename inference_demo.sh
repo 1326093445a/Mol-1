@@ -43,8 +43,7 @@
 # spelled the same.
 # Set MOL_ROOT_DIR to the data/cache root; it also holds the default
 # checkpoint directory. Unset, it falls back to the home directory.
-# Default kernels: cuequivariance multiplication and attention.
-# Optional FlashPairformer: TRIANGLE_MULTIPLICATIVE=flashpairformer bash inference_demo.sh
+# Auto prefers FlashPairformer multiplication and cuEquivariance attention on CUDA.
 # For that backend, install the pinned opt_core package or set OPT_CORE_DIR
 # to its source root (see docs/kernels.md).
 
@@ -75,8 +74,8 @@ inference_command=(
     --use_template "${USE_TEMPLATE:-true}"
     --use_rna_msa "${USE_RNA_MSA:-false}"
     --device "${DEVICE:-auto}"
-    --triangle_attention "${TRIANGLE_ATTENTION:-cuequivariance}"
-    --triangle_multiplicative "${TRIANGLE_MULTIPLICATIVE:-cuequivariance}"
+    --triangle_attention "${TRIANGLE_ATTENTION:-auto}"
+    --triangle_multiplicative "${TRIANGLE_MULTIPLICATIVE:-auto}"
     "$@"
 )
 
